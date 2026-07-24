@@ -8,7 +8,7 @@ import time
 import traceback
 import threading
 import asyncio
-import requests  # ← reCAPTCHA 검증을 위해 추가
+import requests
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, render_template_string
@@ -24,7 +24,7 @@ CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
 
-# 🔐 reCAPTCHA 키 (환경변수로 설정)
+# 🔐 reCAPTCHA 키 (환경변수)
 RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY")
 RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY")
 
@@ -195,9 +195,14 @@ async def assign_role_from_web(token: str, ip: str):
         return False, f"오류 발생: {str(e)}"
 
 # ============================================================
-# Flask 웹서버 (reCAPTCHA 사용)
+# Flask 웹서버 (reCAPTCHA + 루트 경로 추가)
 # ============================================================
 app = Flask(__name__)
+
+# ✅ 루트 경로 - cron-job.org Health Check용
+@app.route('/')
+def home():
+    return "✅ Bot is alive and running!", 200
 
 # reCAPTCHA 검증 함수
 def verify_recaptcha(response_token: str) -> bool:
@@ -217,7 +222,7 @@ def verify_recaptcha(response_token: str) -> bool:
     except:
         return False
 
-# HTML 템플릿 (reCAPTCHA 버전)
+# HTML 템플릿 (reCAPTCHA)
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -261,7 +266,6 @@ def verify_page():
     if not token or token not in pending_verifications:
         return "❌ 유효하지 않거나 만료된 인증 링크입니다.", 400
 
-    # GET: 페이지 표시
     if request.method == 'GET':
         return render_template_string(
             CAPTCHA_PAGE,
@@ -271,7 +275,6 @@ def verify_page():
             success=None
         )
 
-    # POST: reCAPTCHA 검증
     else:
         recaptcha_response = request.form.get('g-recaptcha-response')
         if not recaptcha_response:
@@ -283,7 +286,6 @@ def verify_page():
                 success=None
             )
 
-        # reCAPTCHA 검증
         if not verify_recaptcha(recaptcha_response):
             return render_template_string(
                 CAPTCHA_PAGE,
@@ -293,7 +295,6 @@ def verify_page():
                 success=None
             )
 
-        # 인증 성공 → 역할 부여
         ip = request.remote_addr
         future = asyncio.run_coroutine_threadsafe(
             assign_role_from_web(token, ip),
