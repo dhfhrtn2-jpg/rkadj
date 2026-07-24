@@ -5,29 +5,29 @@ import os
 import random
 import string
 import time
-import io
 import traceback
 import threading
 import asyncio
+import requests  # ← reCAPTCHA 검증을 위해 추가
 from datetime import datetime, timezone, timedelta
 
-from PIL import Image, ImageDraw, ImageFont, ImageFilter
-
-# Flask 웹서버 관련
-from flask import Flask, request, render_template_string, send_file, redirect, url_for
+from flask import Flask, request, render_template_string
 
 # ============================================================
-# 설정 (환경변수에서 불러오기)
+# 설정 (환경변수)
 # ============================================================
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # 🔐 절대 하드코딩 금지!
-BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")  # Render에서 설정 필수
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 PREFIX = "!"
 CONFIG_PATH = "config.json"
 CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
 
-# 🔐 허용된 사용자 ID
+# 🔐 reCAPTCHA 키 (환경변수로 설정)
+RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY")
+RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY")
+
 ALLOWED_USER_IDS = [
     1379356844920799255,  # 본인 Discord ID
 ]
@@ -110,7 +110,7 @@ async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
     await ctx.send(f"✅ 인증 로그를 {channel.mention} 채널에 전송하도록 설정했어요.")
 
 # ============================================================
-# 웹 인증 링크 생성 (BASE_URL 환경변수 사용)
+# 웹 인증 링크 생성
 # ============================================================
 def generate_token() -> str:
     return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -123,7 +123,7 @@ def create_verify_link(user_id: int, guild_id: int) -> str:
         "guild_id": guild_id,
         "expires": expires
     }
-    return f"{BASE_URL}/verify?token={token}"  # ✅ 환경변수 BASE_URL 사용
+    return f"{BASE_URL}/verify?token={token}"
 
 # ============================================================
 # 역할 부여 함수
@@ -195,63 +195,40 @@ async def assign_role_from_web(token: str, ip: str):
         return False, f"오류 발생: {str(e)}"
 
 # ============================================================
-# Flask 웹서버
+# Flask 웹서버 (reCAPTCHA 사용)
 # ============================================================
 app = Flask(__name__)
 
-def generate_captcha_text():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
-
-def create_captcha_image(text: str) -> io.BytesIO:
-    width, height = 200, 80
-    img = Image.new("RGB", (width, height), color=(255, 255, 255))
-    draw = ImageDraw.Draw(img)
-
-    for _ in range(5):
-        x1 = random.randint(0, width)
-        y1 = random.randint(0, height)
-        x2 = random.randint(0, width)
-        y2 = random.randint(0, height)
-        draw.line((x1, y1, x2, y2), fill=(200, 200, 200), width=2)
-
-    for _ in range(50):
-        x = random.randint(0, width-1)
-        y = random.randint(0, height-1)
-        draw.point((x, y), fill=(180, 180, 180))
-
+# reCAPTCHA 검증 함수
+def verify_recaptcha(response_token: str) -> bool:
+    if not RECAPTCHA_SECRET_KEY:
+        return False
     try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 36)
+        res = requests.post(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data={
+                "secret": RECAPTCHA_SECRET_KEY,
+                "response": response_token
+            },
+            timeout=10
+        )
+        data = res.json()
+        return data.get("success", False)
     except:
-        font = ImageFont.load_default()
+        return False
 
-    x = 20
-    for ch in text:
-        color = (random.randint(50, 150), random.randint(50, 150), random.randint(50, 150))
-        char_img = Image.new("RGBA", (50, 60), (0, 0, 0, 0))
-        char_draw = ImageDraw.Draw(char_img)
-        char_draw.text((5, 5), ch, font=font, fill=color)
-        angle = random.randint(-20, 20)
-        char_img = char_img.rotate(angle, expand=True)
-        y_offset = random.randint(10, 30)
-        img.paste(char_img, (x, y_offset), char_img)
-        x += 40
-
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    buf.seek(0)
-    return buf
-
+# HTML 템플릿 (reCAPTCHA 버전)
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <title>인증</title>
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
     <style>
         body { font-family: Arial; text-align: center; padding: 50px; }
         .container { max-width: 400px; margin: 0 auto; border: 1px solid #ccc; padding: 30px; border-radius: 10px; }
-        img { border: 1px solid #ddd; margin: 20px 0; }
-        input[type="text"] { padding: 10px; width: 80%; margin-bottom: 20px; }
+        .g-recaptcha { display: inline-block; margin: 20px 0; }
         button { padding: 10px 30px; background: #4CAF50; color: white; border: none; border-radius: 5px; cursor: pointer; }
         .error { color: red; }
         .success { color: green; }
@@ -260,10 +237,9 @@ CAPTCHA_PAGE = """
 <body>
     <div class="container">
         <h2>🔐 본인 인증</h2>
-        <p>아래 이미지의 코드를 입력하세요.</p>
-        <img src="{{ captcha_url }}" alt="CAPTCHA">
+        <p>로봇이 아님을 인증해주세요.</p>
         <form method="post">
-            <input type="text" name="captcha_input" placeholder="코드 입력" required>
+            <div class="g-recaptcha" data-sitekey="{{ site_key }}"></div>
             <input type="hidden" name="token" value="{{ token }}">
             <br>
             <button type="submit">인증하기</button>
@@ -285,49 +261,63 @@ def verify_page():
     if not token or token not in pending_verifications:
         return "❌ 유효하지 않거나 만료된 인증 링크입니다.", 400
 
+    # GET: 페이지 표시
     if request.method == 'GET':
-        captcha_text = generate_captcha_text()
-        pending_verifications[token]['captcha'] = captcha_text
-        img_buf = create_captcha_image(captcha_text)
-        import base64
-        img_buf.seek(0)
-        img_data = base64.b64encode(img_buf.read()).decode()
-        img_url = f"data:image/png;base64,{img_data}"
-        return render_template_string(CAPTCHA_PAGE, captcha_url=img_url, token=token, error=None, success=None)
+        return render_template_string(
+            CAPTCHA_PAGE,
+            site_key=RECAPTCHA_SITE_KEY or "",
+            token=token,
+            error=None,
+            success=None
+        )
 
+    # POST: reCAPTCHA 검증
     else:
-        user_input = request.form.get('captcha_input', '').strip().upper()
-        stored = pending_verifications.get(token, {})
-        captcha_correct = stored.get('captcha', '')
-
-        if user_input == captcha_correct:
-            ip = request.remote_addr
-            future = asyncio.run_coroutine_threadsafe(
-                assign_role_from_web(token, ip),
-                bot.loop
-            )
-            try:
-                success, message = future.result(timeout=15)
-            except Exception as e:
-                success, message = False, f"서버 오류: {str(e)}"
-
-            if success:
-                return render_template_string(CAPTCHA_PAGE, captcha_url="", token="", error=None, success=message)
-            else:
-                return render_template_string(CAPTCHA_PAGE, captcha_url="", token="", error=message, success=None)
-        else:
-            captcha_text = generate_captcha_text()
-            pending_verifications[token]['captcha'] = captcha_text
-            img_buf = create_captcha_image(captcha_text)
-            import base64
-            img_buf.seek(0)
-            img_data = base64.b64encode(img_buf.read()).decode()
-            img_url = f"data:image/png;base64,{img_data}"
+        recaptcha_response = request.form.get('g-recaptcha-response')
+        if not recaptcha_response:
             return render_template_string(
                 CAPTCHA_PAGE,
-                captcha_url=img_url,
+                site_key=RECAPTCHA_SITE_KEY or "",
                 token=token,
-                error="❌ 코드가 일치하지 않습니다. 다시 시도하세요.",
+                error="❌ reCAPTCHA를 완료해주세요.",
+                success=None
+            )
+
+        # reCAPTCHA 검증
+        if not verify_recaptcha(recaptcha_response):
+            return render_template_string(
+                CAPTCHA_PAGE,
+                site_key=RECAPTCHA_SITE_KEY or "",
+                token=token,
+                error="❌ reCAPTCHA 검증에 실패했습니다. 다시 시도해주세요.",
+                success=None
+            )
+
+        # 인증 성공 → 역할 부여
+        ip = request.remote_addr
+        future = asyncio.run_coroutine_threadsafe(
+            assign_role_from_web(token, ip),
+            bot.loop
+        )
+        try:
+            success, message = future.result(timeout=15)
+        except Exception as e:
+            success, message = False, f"서버 오류: {str(e)}"
+
+        if success:
+            return render_template_string(
+                CAPTCHA_PAGE,
+                site_key=RECAPTCHA_SITE_KEY or "",
+                token="",
+                error=None,
+                success=message
+            )
+        else:
+            return render_template_string(
+                CAPTCHA_PAGE,
+                site_key=RECAPTCHA_SITE_KEY or "",
+                token=token,
+                error=message,
                 success=None
             )
 
