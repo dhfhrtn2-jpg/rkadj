@@ -1,3 +1,3 @@
 discord.py
-Pillow
-flask
+Flask
+requests
