@@ -9,6 +9,7 @@ import traceback
 import threading
 import asyncio
 import requests
+import re
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, render_template_string
@@ -62,7 +63,7 @@ def get_guild_cfg(guild_id: int) -> dict:
 pending_verifications = {}
 
 # ============================================================
-# 권한 체크
+# 권한 체크 (서버 소유자 + 허용된 사용자)
 # ============================================================
 def owner_or_allowed():
     async def predicate(ctx: commands.Context) -> bool:
@@ -86,12 +87,12 @@ async def on_command_error(ctx, error):
     elif isinstance(error, commands.ChannelNotFound):
         await ctx.send("❌ 해당 채널을 찾을 수 없어요. 채널을 정확히 멘션해주세요.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ 필요한 값이 빠졌어요. 사용법을 확인해주세요. 예) `!인증역할 @역할`")
+        await ctx.send("❌ 필요한 값이 빠졌어요. 사용법을 확인해주세요.")
     else:
         raise error
 
 # ============================================================
-# 명령어
+# 기존 명령어 (인증역할, 로그채널, 콘솔생성)
 # ============================================================
 @bot.command(name="인증역할")
 @owner_or_allowed()
@@ -110,7 +111,162 @@ async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
     await ctx.send(f"✅ 인증 로그를 {channel.mention} 채널에 전송하도록 설정했어요.")
 
 # ============================================================
-# 웹 인증 링크 생성
+# ✨ 새로운 명령어: 인증채널 (카테고리 제외, 역할에 모든 권한)
+# ============================================================
+@bot.command(name="인증채널")
+@owner_or_allowed()
+async def set_auth_channel(ctx, *, args: str):
+    """
+    사용법: !인증채널 카테고리이름 @역할
+    예: !인증채널 일반 @인증된
+    """
+    # 역할 멘션 추출 (<@&숫자>)
+    role_match = re.search(r'<@&(\d+)>', args)
+    if not role_match:
+        await ctx.send("❌ 역할을 멘션해주세요. 예: `!인증채널 카테고리이름 @역할`")
+        return
+    role_id = int(role_match.group(1))
+    role = ctx.guild.get_role(role_id)
+    if not role:
+        await ctx.send("❌ 해당 역할을 찾을 수 없어요.")
+        return
+
+    # 카테고리 이름 추출 (역할 멘션 제거)
+    category_name = args.replace(role_match.group(0), '').strip()
+    if not category_name:
+        await ctx.send("❌ 카테고리 이름을 입력해주세요.")
+        return
+
+    category = discord.utils.get(ctx.guild.categories, name=category_name)
+    if not category:
+        await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
+        return
+
+    # 설정 저장
+    gcfg = get_guild_cfg(ctx.guild.id)
+    gcfg["main_category_id"] = category.id
+    gcfg["allowed_role_id"] = role.id
+    if "exception_category_ids" not in gcfg:
+        gcfg["exception_category_ids"] = []
+    save_config(config)
+
+    # 권한 설정 실행
+    await setup_all_permissions(ctx.guild, category.id, role.id, gcfg["exception_category_ids"])
+    await ctx.send(
+        f"✅ 인증 채널 설정 완료!\n"
+        f"카테고리 '{category.name}'를 제외한 모든 채널에서 {role.mention} 역할이 **보기 및 채팅** 가능합니다."
+    )
+
+# ============================================================
+# ✨ 새로운 명령어: 예외채널 (특정 카테고리에서 채팅 금지)
+# ============================================================
+@bot.command(name="예외채널")
+@owner_or_allowed()
+async def set_exception_channel(ctx, *, category_name: str):
+    """
+    사용법: !예외채널 카테고리이름
+    예: !예외채널 비밀채널
+    """
+    category = discord.utils.get(ctx.guild.categories, name=category_name)
+    if not category:
+        await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
+        return
+
+    gcfg = get_guild_cfg(ctx.guild.id)
+    if "exception_category_ids" not in gcfg:
+        gcfg["exception_category_ids"] = []
+    if category.id in gcfg["exception_category_ids"]:
+        await ctx.send(f"⚠️ 이미 예외 카테고리로 등록된 '{category_name}' 입니다.")
+        return
+
+    gcfg["exception_category_ids"].append(category.id)
+    save_config(config)
+
+    allowed_role_id = gcfg.get("allowed_role_id")
+    if not allowed_role_id:
+        await ctx.send("❌ 먼저 `!인증채널`로 인증 역할을 설정해주세요.")
+        return
+
+    role = ctx.guild.get_role(allowed_role_id)
+    if not role:
+        await ctx.send("❌ 설정된 역할을 찾을 수 없어요.")
+        return
+
+    # 해당 카테고리 내 모든 채널에서 채팅 금지 (보기는 허용)
+    for channel in category.channels:
+        if isinstance(channel, discord.TextChannel):
+            try:
+                overwrite = channel.overwrites_for(role)
+                overwrite.view_channel = True
+                overwrite.send_messages = False
+                await channel.set_permissions(role, overwrite=overwrite)
+            except discord.Forbidden:
+                await ctx.send(f"⚠️ {channel.mention} 채널 권한 설정에 실패했어요 (봇 권한 부족).")
+            except Exception as e:
+                await ctx.send(f"⚠️ {channel.mention} 채널 오류: {str(e)}")
+
+    await ctx.send(
+        f"✅ '{category.name}' 카테고리 내 모든 채널에서 {role.mention} 역할의 **채팅이 제한**되었습니다.\n"
+        f"(관리자는 계속 채팅 가능)"
+    )
+
+# ============================================================
+# 권한 설정 헬퍼 함수
+# ============================================================
+async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
+    """
+    모든 채널/카테고리를 순회하며 권한을 설정합니다.
+    - main_category_id와 그 하위 채널은 제외
+    - exception_category_ids에 포함된 카테고리와 그 하위 채널은 제외
+    - 나머지 모든 채널/카테고리에 allowed_role_id에 view_channel=True, send_messages=True (텍스트 채널인 경우)
+    """
+    role = guild.get_role(allowed_role_id)
+    if not role:
+        return
+
+    # 모든 채널(텍스트, 음성, 카테고리)에 대해 처리
+    for channel in guild.channels:
+        # main_category 자체는 제외
+        if channel.id == main_category_id:
+            continue
+        # main_category의 하위 채널 제외
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id == main_category_id:
+            continue
+        # exception 카테고리 자체 제외
+        if channel.id in exception_category_ids:
+            continue
+        # exception 카테고리의 하위 채널 제외
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id in exception_category_ids:
+            continue
+
+        try:
+            overwrite = channel.overwrites_for(role)
+            overwrite.view_channel = True
+            if isinstance(channel, discord.TextChannel):
+                overwrite.send_messages = True
+            await channel.set_permissions(role, overwrite=overwrite)
+        except discord.Forbidden:
+            # 봇 권한 부족 시 무시
+            pass
+        except Exception as e:
+            print(f"권한 설정 오류 ({channel.name}): {e}")
+
+    # exception_category_ids에 등록된 카테고리 내 채널들은 따로 처리 (send_messages False)
+    for cat_id in exception_category_ids:
+        cat = guild.get_channel(cat_id)
+        if cat and isinstance(cat, discord.CategoryChannel):
+            for ch in cat.channels:
+                if isinstance(ch, discord.TextChannel):
+                    try:
+                        overwrite = ch.overwrites_for(role)
+                        overwrite.view_channel = True
+                        overwrite.send_messages = False
+                        await ch.set_permissions(role, overwrite=overwrite)
+                    except:
+                        pass
+
+# ============================================================
+# 웹 인증 관련 (기존 코드 유지)
 # ============================================================
 def generate_token() -> str:
     return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -125,9 +281,6 @@ def create_verify_link(user_id: int, guild_id: int) -> str:
     }
     return f"{BASE_URL}/verify?token={token}"
 
-# ============================================================
-# 역할 부여 함수
-# ============================================================
 async def assign_role_from_web(token: str, ip: str):
     try:
         if token not in pending_verifications:
@@ -195,16 +348,14 @@ async def assign_role_from_web(token: str, ip: str):
         return False, f"오류 발생: {str(e)}"
 
 # ============================================================
-# Flask 웹서버 (reCAPTCHA + 루트 경로 추가)
+# Flask 웹서버 (reCAPTCHA + 루트 경로)
 # ============================================================
 app = Flask(__name__)
 
-# ✅ 루트 경로 - cron-job.org Health Check용
 @app.route('/')
 def home():
     return "✅ Bot is alive and running!", 200
 
-# reCAPTCHA 검증 함수
 def verify_recaptcha(response_token: str) -> bool:
     if not RECAPTCHA_SECRET_KEY:
         return False
@@ -222,7 +373,6 @@ def verify_recaptcha(response_token: str) -> bool:
     except:
         return False
 
-# HTML 템플릿 (reCAPTCHA)
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
 <html>
@@ -323,7 +473,7 @@ def verify_page():
             )
 
 # ============================================================
-# 디스코드 뷰
+# 디스코드 뷰 (콘솔 버튼)
 # ============================================================
 class ConsoleView(discord.ui.View):
     def __init__(self):
