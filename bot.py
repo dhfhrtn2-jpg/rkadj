@@ -116,11 +116,6 @@ async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
 @bot.command(name="인증채널")
 @owner_or_allowed()
 async def set_auth_channel(ctx, *, args: str):
-    """
-    사용법: !인증채널 카테고리이름 @역할
-    예: !인증채널 일반 @인증된
-    """
-    # 역할 멘션 추출 (<@&숫자>)
     role_match = re.search(r'<@&(\d+)>', args)
     if not role_match:
         await ctx.send("❌ 역할을 멘션해주세요. 예: `!인증채널 카테고리이름 @역할`")
@@ -131,7 +126,6 @@ async def set_auth_channel(ctx, *, args: str):
         await ctx.send("❌ 해당 역할을 찾을 수 없어요.")
         return
 
-    # 카테고리 이름 추출 (역할 멘션 제거)
     category_name = args.replace(role_match.group(0), '').strip()
     if not category_name:
         await ctx.send("❌ 카테고리 이름을 입력해주세요.")
@@ -142,7 +136,6 @@ async def set_auth_channel(ctx, *, args: str):
         await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
         return
 
-    # 설정 저장
     gcfg = get_guild_cfg(ctx.guild.id)
     gcfg["main_category_id"] = category.id
     gcfg["allowed_role_id"] = role.id
@@ -150,7 +143,6 @@ async def set_auth_channel(ctx, *, args: str):
         gcfg["exception_category_ids"] = []
     save_config(config)
 
-    # 권한 설정 실행
     await setup_all_permissions(ctx.guild, category.id, role.id, gcfg["exception_category_ids"])
     await ctx.send(
         f"✅ 인증 채널 설정 완료!\n"
@@ -163,10 +155,6 @@ async def set_auth_channel(ctx, *, args: str):
 @bot.command(name="예외채널")
 @owner_or_allowed()
 async def set_exception_channel(ctx, *, category_name: str):
-    """
-    사용법: !예외채널 카테고리이름
-    예: !예외채널 비밀채널
-    """
     category = discord.utils.get(ctx.guild.categories, name=category_name)
     if not category:
         await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
@@ -192,7 +180,6 @@ async def set_exception_channel(ctx, *, category_name: str):
         await ctx.send("❌ 설정된 역할을 찾을 수 없어요.")
         return
 
-    # 해당 카테고리 내 모든 채널에서 채팅 금지 (보기는 허용)
     for channel in category.channels:
         if isinstance(channel, discord.TextChannel):
             try:
@@ -214,28 +201,17 @@ async def set_exception_channel(ctx, *, category_name: str):
 # 권한 설정 헬퍼 함수
 # ============================================================
 async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
-    """
-    모든 채널/카테고리를 순회하며 권한을 설정합니다.
-    - main_category_id와 그 하위 채널은 제외
-    - exception_category_ids에 포함된 카테고리와 그 하위 채널은 제외
-    - 나머지 모든 채널/카테고리에 allowed_role_id에 view_channel=True, send_messages=True (텍스트 채널인 경우)
-    """
     role = guild.get_role(allowed_role_id)
     if not role:
         return
 
-    # 모든 채널(텍스트, 음성, 카테고리)에 대해 처리
     for channel in guild.channels:
-        # main_category 자체는 제외
         if channel.id == main_category_id:
             continue
-        # main_category의 하위 채널 제외
         if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id == main_category_id:
             continue
-        # exception 카테고리 자체 제외
         if channel.id in exception_category_ids:
             continue
-        # exception 카테고리의 하위 채널 제외
         if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id in exception_category_ids:
             continue
 
@@ -246,12 +222,10 @@ async def setup_all_permissions(guild, main_category_id, allowed_role_id, except
                 overwrite.send_messages = True
             await channel.set_permissions(role, overwrite=overwrite)
         except discord.Forbidden:
-            # 봇 권한 부족 시 무시
             pass
         except Exception as e:
             print(f"권한 설정 오류 ({channel.name}): {e}")
 
-    # exception_category_ids에 등록된 카테고리 내 채널들은 따로 처리 (send_messages False)
     for cat_id in exception_category_ids:
         cat = guild.get_channel(cat_id)
         if cat and isinstance(cat, discord.CategoryChannel):
@@ -266,7 +240,7 @@ async def setup_all_permissions(guild, main_category_id, allowed_role_id, except
                         pass
 
 # ============================================================
-# 웹 인증 관련 (기존 코드 유지)
+# 웹 인증 관련
 # ============================================================
 def generate_token() -> str:
     return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -334,7 +308,7 @@ async def assign_role_from_web(token: str, ip: str):
                 )
                 embed.add_field(name="유저", value=f"{member} ({member.id})", inline=False)
                 embed.add_field(name="인증 시각", value=now_kst.strftime("%Y-%m-%d %H:%M:%S (KST)"), inline=False)
-                embed.add_field(name="IP 주소", value=ip, inline=False)
+                embed.add_field(name="🌐 IP 주소", value=ip, inline=False)
                 embed.set_thumbnail(url=member.display_avatar.url)
                 try:
                     await log_channel.send(embed=embed)
@@ -445,7 +419,11 @@ def verify_page():
                 success=None
             )
 
-        ip = request.remote_addr
+        # 🔥 실제 클라이언트 IP 추출 (X-Forwarded-For 고려)
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        if ip and ',' in ip:
+            ip = ip.split(',')[0].strip()
+
         future = asyncio.run_coroutine_threadsafe(
             assign_role_from_web(token, ip),
             bot.loop
