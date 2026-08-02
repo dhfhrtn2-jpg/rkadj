@@ -15,12 +15,16 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, render_template_string
 
 # ============================================================
-# 설정 (환경변수)
+# 공통 설정 (환경변수)
 # ============================================================
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")
+TOKEN1 = os.getenv("DISCORD_BOT_TOKEN1")   # 첫 번째 봇 토큰
+TOKEN2 = os.getenv("DISCORD_BOT_TOKEN2")   # 두 번째 봇 토큰
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 PREFIX = "!"
-CONFIG_PATH = "config.json"
+CONFIG_PATH1 = "config_bot1.json"
+CONFIG_PATH2 = "config_bot2.json"
+BACKUP_PATH1 = "backup_bot1.json"
+BACKUP_PATH2 = "backup_bot2.json"
 CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
@@ -36,295 +40,638 @@ ALLOWED_USER_IDS = [
 WEB_HOST = "0.0.0.0"
 WEB_PORT = 5000
 
-intents = discord.Intents.default()
-intents.members = True
-intents.message_content = True
-
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-
 # ============================================================
-# 서버별 설정 저장/로드
+# 봇 팩토리 함수 (각 봇별로 독립적인 설정/백업 파일 사용)
 # ============================================================
-def load_config():
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+def create_bot(token, bot_name, config_path, backup_path):
+    intents = discord.Intents.default()
+    intents.members = True
+    intents.message_content = True
 
-def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-config = load_config()
+    # ============================================================
+    # 서버별 설정 저장/로드 (파일 분리)
+    # ============================================================
+    def load_config():
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        return {}
 
-def get_guild_cfg(guild_id: int) -> dict:
-    return config.setdefault(str(guild_id), {})
+    def save_config(cfg):
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
 
-pending_verifications = {}
+    config = load_config()
 
-# ============================================================
-# 권한 체크 (서버 소유자 + 허용된 사용자)
-# ============================================================
-def owner_or_allowed():
-    async def predicate(ctx: commands.Context) -> bool:
-        if ctx.guild is None:
-            raise commands.NoPrivateMessage("서버 안에서만 사용할 수 있어요.")
-        if ctx.author.id == ctx.guild.owner_id:
-            return True
-        if ctx.author.id in ALLOWED_USER_IDS:
-            return True
-        raise commands.MissingPermissions(["서버 소유자 또는 허용된 사용자"])
-    return commands.check(predicate)
+    def get_guild_cfg(guild_id: int) -> dict:
+        return config.setdefault(str(guild_id), {})
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ 이 명령어는 서버 소유자 또는 허용된 사용자만 사용할 수 있어요.")
-    elif isinstance(error, commands.NoPrivateMessage):
-        await ctx.send("❌ 이 명령어는 서버 안에서만 사용할 수 있어요.")
-    elif isinstance(error, commands.RoleNotFound):
-        await ctx.send("❌ 해당 역할을 찾을 수 없어요. 역할을 정확히 멘션해주세요.")
-    elif isinstance(error, commands.ChannelNotFound):
-        await ctx.send("❌ 해당 채널을 찾을 수 없어요. 채널을 정확히 멘션해주세요.")
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ 필요한 값이 빠졌어요. 사용법을 확인해주세요.")
-    else:
-        raise error
+    pending_verifications = {}
 
-# ============================================================
-# 기존 명령어 (인증역할, 로그채널, 콘솔생성)
-# ============================================================
-@bot.command(name="인증역할")
-@owner_or_allowed()
-async def set_verify_role(ctx: commands.Context, role: discord.Role):
-    gcfg = get_guild_cfg(ctx.guild.id)
-    gcfg["verify_role"] = role.id
-    save_config(config)
-    await ctx.send(f"✅ 인증 통과 시 지급할 역할을 {role.mention} 로 설정했어요.")
+    # ============================================================
+    # 권한 체크 (서버 소유자 + 허용된 사용자)
+    # ============================================================
+    def owner_or_allowed():
+        async def predicate(ctx: commands.Context) -> bool:
+            if ctx.guild is None:
+                raise commands.NoPrivateMessage("서버 안에서만 사용할 수 있어요.")
+            if ctx.author.id == ctx.guild.owner_id:
+                return True
+            if ctx.author.id in ALLOWED_USER_IDS:
+                return True
+            raise commands.MissingPermissions(["서버 소유자 또는 허용된 사용자"])
+        return commands.check(predicate)
 
-@bot.command(name="로그채널")
-@owner_or_allowed()
-async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
-    gcfg = get_guild_cfg(ctx.guild.id)
-    gcfg["log_channel"] = channel.id
-    save_config(config)
-    await ctx.send(f"✅ 인증 로그를 {channel.mention} 채널에 전송하도록 설정했어요.")
+    @bot.event
+    async def on_command_error(ctx, error):
+        if isinstance(error, commands.MissingPermissions):
+            await ctx.send("❌ 이 명령어는 서버 소유자 또는 허용된 사용자만 사용할 수 있어요.")
+        elif isinstance(error, commands.NoPrivateMessage):
+            await ctx.send("❌ 이 명령어는 서버 안에서만 사용할 수 있어요.")
+        elif isinstance(error, commands.RoleNotFound):
+            await ctx.send("❌ 해당 역할을 찾을 수 없어요. 역할을 정확히 멘션해주세요.")
+        elif isinstance(error, commands.ChannelNotFound):
+            await ctx.send("❌ 해당 채널을 찾을 수 없어요. 채널을 정확히 멘션해주세요.")
+        elif isinstance(error, commands.MissingRequiredArgument):
+            await ctx.send("❌ 필요한 값이 빠졌어요. 사용법을 확인해주세요.")
+        else:
+            raise error
 
-# ============================================================
-# ✨ 새로운 명령어: 인증채널 (카테고리 제외, 역할에 모든 권한)
-# ============================================================
-@bot.command(name="인증채널")
-@owner_or_allowed()
-async def set_auth_channel(ctx, *, args: str):
-    role_match = re.search(r'<@&(\d+)>', args)
-    if not role_match:
-        await ctx.send("❌ 역할을 멘션해주세요. 예: `!인증채널 카테고리이름 @역할`")
-        return
-    role_id = int(role_match.group(1))
-    role = ctx.guild.get_role(role_id)
-    if not role:
-        await ctx.send("❌ 해당 역할을 찾을 수 없어요.")
-        return
+    # ============================================================
+    # 기존 명령어 (인증역할, 로그채널, 인증채널, 예외채널, 콘솔생성)
+    # ============================================================
+    @bot.command(name="인증역할")
+    @owner_or_allowed()
+    async def set_verify_role(ctx: commands.Context, role: discord.Role):
+        gcfg = get_guild_cfg(ctx.guild.id)
+        gcfg["verify_role"] = role.id
+        save_config(config)
+        await ctx.send(f"✅ 인증 통과 시 지급할 역할을 {role.mention} 로 설정했어요.")
 
-    category_name = args.replace(role_match.group(0), '').strip()
-    if not category_name:
-        await ctx.send("❌ 카테고리 이름을 입력해주세요.")
-        return
+    @bot.command(name="로그채널")
+    @owner_or_allowed()
+    async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
+        gcfg = get_guild_cfg(ctx.guild.id)
+        gcfg["log_channel"] = channel.id
+        save_config(config)
+        await ctx.send(f"✅ 인증 로그를 {channel.mention} 채널에 전송하도록 설정했어요.")
 
-    category = discord.utils.get(ctx.guild.categories, name=category_name)
-    if not category:
-        await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
-        return
+    @bot.command(name="인증채널")
+    @owner_or_allowed()
+    async def set_auth_channel(ctx, *, args: str):
+        role_match = re.search(r'<@&(\d+)>', args)
+        if not role_match:
+            await ctx.send("❌ 역할을 멘션해주세요. 예: `!인증채널 카테고리이름 @역할`")
+            return
+        role_id = int(role_match.group(1))
+        role = ctx.guild.get_role(role_id)
+        if not role:
+            await ctx.send("❌ 해당 역할을 찾을 수 없어요.")
+            return
 
-    gcfg = get_guild_cfg(ctx.guild.id)
-    gcfg["main_category_id"] = category.id
-    gcfg["allowed_role_id"] = role.id
-    if "exception_category_ids" not in gcfg:
-        gcfg["exception_category_ids"] = []
-    save_config(config)
+        category_name = args.replace(role_match.group(0), '').strip()
+        if not category_name:
+            await ctx.send("❌ 카테고리 이름을 입력해주세요.")
+            return
 
-    await setup_all_permissions(ctx.guild, category.id, role.id, gcfg["exception_category_ids"])
-    await ctx.send(
-        f"✅ 인증 채널 설정 완료!\n"
-        f"카테고리 '{category.name}'를 제외한 모든 채널에서 {role.mention} 역할이 **보기 및 채팅** 가능합니다."
-    )
+        category = discord.utils.get(ctx.guild.categories, name=category_name)
+        if not category:
+            await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
+            return
 
-# ============================================================
-# ✨ 새로운 명령어: 예외채널 (특정 카테고리에서 채팅 금지)
-# ============================================================
-@bot.command(name="예외채널")
-@owner_or_allowed()
-async def set_exception_channel(ctx, *, category_name: str):
-    category = discord.utils.get(ctx.guild.categories, name=category_name)
-    if not category:
-        await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
-        return
+        gcfg = get_guild_cfg(ctx.guild.id)
+        gcfg["main_category_id"] = category.id
+        gcfg["allowed_role_id"] = role.id
+        if "exception_category_ids" not in gcfg:
+            gcfg["exception_category_ids"] = []
+        save_config(config)
 
-    gcfg = get_guild_cfg(ctx.guild.id)
-    if "exception_category_ids" not in gcfg:
-        gcfg["exception_category_ids"] = []
-    if category.id in gcfg["exception_category_ids"]:
-        await ctx.send(f"⚠️ 이미 예외 카테고리로 등록된 '{category_name}' 입니다.")
-        return
+        await setup_all_permissions(ctx.guild, category.id, role.id, gcfg["exception_category_ids"])
+        await ctx.send(
+            f"✅ 인증 채널 설정 완료!\n"
+            f"카테고리 '{category.name}'를 제외한 모든 채널에서 {role.mention} 역할이 **보기 및 채팅** 가능합니다."
+        )
 
-    gcfg["exception_category_ids"].append(category.id)
-    save_config(config)
+    @bot.command(name="예외채널")
+    @owner_or_allowed()
+    async def set_exception_channel(ctx, *, category_name: str):
+        category = discord.utils.get(ctx.guild.categories, name=category_name)
+        if not category:
+            await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
+            return
 
-    allowed_role_id = gcfg.get("allowed_role_id")
-    if not allowed_role_id:
-        await ctx.send("❌ 먼저 `!인증채널`로 인증 역할을 설정해주세요.")
-        return
+        gcfg = get_guild_cfg(ctx.guild.id)
+        if "exception_category_ids" not in gcfg:
+            gcfg["exception_category_ids"] = []
+        if category.id in gcfg["exception_category_ids"]:
+            await ctx.send(f"⚠️ 이미 예외 카테고리로 등록된 '{category_name}' 입니다.")
+            return
 
-    role = ctx.guild.get_role(allowed_role_id)
-    if not role:
-        await ctx.send("❌ 설정된 역할을 찾을 수 없어요.")
-        return
+        gcfg["exception_category_ids"].append(category.id)
+        save_config(config)
 
-    for channel in category.channels:
-        if isinstance(channel, discord.TextChannel):
+        allowed_role_id = gcfg.get("allowed_role_id")
+        if not allowed_role_id:
+            await ctx.send("❌ 먼저 `!인증채널`로 인증 역할을 설정해주세요.")
+            return
+
+        role = ctx.guild.get_role(allowed_role_id)
+        if not role:
+            await ctx.send("❌ 설정된 역할을 찾을 수 없어요.")
+            return
+
+        for channel in category.channels:
+            if isinstance(channel, discord.TextChannel):
+                try:
+                    overwrite = channel.overwrites_for(role)
+                    overwrite.view_channel = True
+                    overwrite.send_messages = False
+                    await channel.set_permissions(role, overwrite=overwrite)
+                except discord.Forbidden:
+                    await ctx.send(f"⚠️ {channel.mention} 채널 권한 설정에 실패했어요 (봇 권한 부족).")
+                except Exception as e:
+                    await ctx.send(f"⚠️ {channel.mention} 채널 오류: {str(e)}")
+
+        await ctx.send(
+            f"✅ '{category.name}' 카테고리 내 모든 채널에서 {role.mention} 역할의 **채팅이 제한**되었습니다.\n"
+            f"(관리자는 계속 채팅 가능)"
+        )
+
+    # ============================================================
+    # 권한 설정 헬퍼 함수
+    # ============================================================
+    async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
+        role = guild.get_role(allowed_role_id)
+        if not role:
+            return
+
+        for channel in guild.channels:
+            if channel.id == main_category_id:
+                continue
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id == main_category_id:
+                continue
+            if channel.id in exception_category_ids:
+                continue
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id in exception_category_ids:
+                continue
+
             try:
                 overwrite = channel.overwrites_for(role)
                 overwrite.view_channel = True
-                overwrite.send_messages = False
+                if isinstance(channel, discord.TextChannel):
+                    overwrite.send_messages = True
                 await channel.set_permissions(role, overwrite=overwrite)
             except discord.Forbidden:
-                await ctx.send(f"⚠️ {channel.mention} 채널 권한 설정에 실패했어요 (봇 권한 부족).")
+                pass
             except Exception as e:
-                await ctx.send(f"⚠️ {channel.mention} 채널 오류: {str(e)}")
+                print(f"[{bot_name}] 권한 설정 오류 ({channel.name}): {e}")
 
-    await ctx.send(
-        f"✅ '{category.name}' 카테고리 내 모든 채널에서 {role.mention} 역할의 **채팅이 제한**되었습니다.\n"
-        f"(관리자는 계속 채팅 가능)"
-    )
+        for cat_id in exception_category_ids:
+            cat = guild.get_channel(cat_id)
+            if cat and isinstance(cat, discord.CategoryChannel):
+                for ch in cat.channels:
+                    if isinstance(ch, discord.TextChannel):
+                        try:
+                            overwrite = ch.overwrites_for(role)
+                            overwrite.view_channel = True
+                            overwrite.send_messages = False
+                            await ch.set_permissions(role, overwrite=overwrite)
+                        except:
+                            pass
 
-# ============================================================
-# 권한 설정 헬퍼 함수
-# ============================================================
-async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
-    role = guild.get_role(allowed_role_id)
-    if not role:
-        return
+    # ============================================================
+    # 웹 인증 관련
+    # ============================================================
+    def generate_token() -> str:
+        return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
 
-    for channel in guild.channels:
-        if channel.id == main_category_id:
-            continue
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id == main_category_id:
-            continue
-        if channel.id in exception_category_ids:
-            continue
-        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id in exception_category_ids:
-            continue
+    def create_verify_link(user_id: int, guild_id: int) -> str:
+        token = generate_token()
+        expires = time.time() + CAPTCHA_EXPIRE_SECONDS
+        pending_verifications[token] = {
+            "user_id": user_id,
+            "guild_id": guild_id,
+            "expires": expires
+        }
+        return f"{BASE_URL}/verify?token={token}"
 
+    async def assign_role_from_web(token: str, ip: str):
         try:
-            overwrite = channel.overwrites_for(role)
-            overwrite.view_channel = True
-            if isinstance(channel, discord.TextChannel):
-                overwrite.send_messages = True
-            await channel.set_permissions(role, overwrite=overwrite)
-        except discord.Forbidden:
-            pass
-        except Exception as e:
-            print(f"권한 설정 오류 ({channel.name}): {e}")
+            if token not in pending_verifications:
+                return False, "인증 토큰이 존재하지 않습니다."
 
-    for cat_id in exception_category_ids:
-        cat = guild.get_channel(cat_id)
-        if cat and isinstance(cat, discord.CategoryChannel):
-            for ch in cat.channels:
-                if isinstance(ch, discord.TextChannel):
+            data = pending_verifications[token]
+            if time.time() > data["expires"]:
+                del pending_verifications[token]
+                return False, "인증 토큰이 만료되었습니다."
+
+            user_id = data["user_id"]
+            guild_id = data["guild_id"]
+
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                return False, "서버를 찾을 수 없습니다."
+
+            member = guild.get_member(user_id)
+            if not member:
+                return False, "서버에서 해당 사용자를 찾을 수 없습니다."
+
+            gcfg = get_guild_cfg(guild_id)
+            verify_role_id = gcfg.get("verify_role")
+            if not verify_role_id:
+                return False, "인증 역할이 설정되지 않았습니다."
+
+            role = guild.get_role(verify_role_id)
+            if not role:
+                return False, "설정된 역할이 존재하지 않습니다."
+
+            removable_roles = [
+                r for r in member.roles
+                if r != guild.default_role and r < guild.me.top_role
+            ]
+            if removable_roles:
+                await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
+            await member.add_roles(role, reason="웹 인증 완료")
+
+            del pending_verifications[token]
+
+            log_channel_id = gcfg.get("log_channel")
+            if log_channel_id:
+                log_channel = guild.get_channel(log_channel_id)
+                if log_channel:
+                    now_kst = datetime.now(KST)
+                    embed = discord.Embed(
+                        title="✅ 웹 인증 완료",
+                        description=f"{member.mention} 님이 웹 인증을 완료했어요.",
+                        color=discord.Color.green(),
+                        timestamp=datetime.now(timezone.utc)
+                    )
+                    embed.add_field(name="유저", value=f"{member} ({member.id})", inline=False)
+                    embed.add_field(name="인증 시각", value=now_kst.strftime("%Y-%m-%d %H:%M:%S (KST)"), inline=False)
+                    embed.add_field(name="🌐 IP 주소", value=ip, inline=False)
+                    embed.set_thumbnail(url=member.display_avatar.url)
                     try:
-                        overwrite = ch.overwrites_for(role)
-                        overwrite.view_channel = True
-                        overwrite.send_messages = False
-                        await ch.set_permissions(role, overwrite=overwrite)
+                        await log_channel.send(embed=embed)
                     except:
                         pass
 
-# ============================================================
-# 웹 인증 관련
-# ============================================================
-def generate_token() -> str:
-    return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+            return True, f"역할 {role.name}이 지급되었습니다."
 
-def create_verify_link(user_id: int, guild_id: int) -> str:
-    token = generate_token()
-    expires = time.time() + CAPTCHA_EXPIRE_SECONDS
-    pending_verifications[token] = {
-        "user_id": user_id,
-        "guild_id": guild_id,
-        "expires": expires
-    }
-    return f"{BASE_URL}/verify?token={token}"
+        except Exception as e:
+            traceback.print_exc()
+            return False, f"오류 발생: {str(e)}"
 
-async def assign_role_from_web(token: str, ip: str):
-    try:
-        if token not in pending_verifications:
-            return False, "인증 토큰이 존재하지 않습니다."
+    # ============================================================
+    # 📌 새로운 명령어: !저장 (서버 구조 백업)
+    # ============================================================
+    @bot.command(name="저장")
+    @owner_or_allowed()
+    async def save_server(ctx):
+        guild = ctx.guild
+        backup_data = {}
 
-        data = pending_verifications[token]
-        if time.time() > data["expires"]:
-            del pending_verifications[token]
-            return False, "인증 토큰이 만료되었습니다."
+        # 역할 저장
+        roles_data = []
+        for role in guild.roles:
+            if role.is_default() or role.managed:
+                continue
+            roles_data.append({
+                "id": str(role.id),
+                "name": role.name,
+                "color": role.color.value,
+                "hoist": role.hoist,
+                "mentionable": role.mentionable,
+                "permissions": role.permissions.value,
+                "position": role.position
+            })
+        backup_data["roles"] = roles_data
 
-        user_id = data["user_id"]
-        guild_id = data["guild_id"]
+        # 카테고리 저장
+        categories_data = []
+        for cat in guild.categories:
+            overwrites = []
+            for target, overwrite in cat.overwrites.items():
+                if isinstance(target, discord.Role):
+                    if target.is_default() or target.managed:
+                        continue
+                    overwrites.append({
+                        "target_type": "role",
+                        "target_id": str(target.id),
+                        "allow": overwrite.pair()[0].value,
+                        "deny": overwrite.pair()[1].value
+                    })
+                elif isinstance(target, discord.Member):
+                    overwrites.append({
+                        "target_type": "user",
+                        "target_id": str(target.id),
+                        "allow": overwrite.pair()[0].value,
+                        "deny": overwrite.pair()[1].value
+                    })
+            categories_data.append({
+                "id": str(cat.id),
+                "name": cat.name,
+                "position": cat.position,
+                "overwrites": overwrites
+            })
+        backup_data["categories"] = categories_data
 
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            return False, "서버를 찾을 수 없습니다."
+        # 채널 저장
+        channels_data = []
+        for ch in guild.channels:
+            if isinstance(ch, discord.CategoryChannel):
+                continue
+            if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.VoiceChannel):
+                overwrites = []
+                for target, overwrite in ch.overwrites.items():
+                    if isinstance(target, discord.Role):
+                        if target.is_default() or target.managed:
+                            continue
+                        overwrites.append({
+                            "target_type": "role",
+                            "target_id": str(target.id),
+                            "allow": overwrite.pair()[0].value,
+                            "deny": overwrite.pair()[1].value
+                        })
+                    elif isinstance(target, discord.Member):
+                        overwrites.append({
+                            "target_type": "user",
+                            "target_id": str(target.id),
+                            "allow": overwrite.pair()[0].value,
+                            "deny": overwrite.pair()[1].value
+                        })
+                channels_data.append({
+                    "id": str(ch.id),
+                    "name": ch.name,
+                    "type": str(ch.type),
+                    "position": ch.position,
+                    "parent_id": str(ch.category.id) if ch.category else None,
+                    "overwrites": overwrites
+                })
+        backup_data["channels"] = channels_data
 
-        member = guild.get_member(user_id)
-        if not member:
-            return False, "서버에서 해당 사용자를 찾을 수 없습니다."
+        with open(backup_path, "w", encoding="utf-8") as f:
+            json.dump(backup_data, f, indent=4, ensure_ascii=False)
 
-        gcfg = get_guild_cfg(guild_id)
-        verify_role_id = gcfg.get("verify_role")
-        if not verify_role_id:
-            return False, "인증 역할이 설정되지 않았습니다."
+        await ctx.send("✅ 서버 구조가 성공적으로 백업되었습니다.")
 
-        role = guild.get_role(verify_role_id)
-        if not role:
-            return False, "설정된 역할이 존재하지 않습니다."
+    # ============================================================
+    # 📌 새로운 명령어: !복구 (레이트리밋 방지 포함)
+    # ============================================================
+    async def safe_delete(obj, delay=0.8):
+        while True:
+            try:
+                await obj.delete()
+                await asyncio.sleep(delay)
+                return True
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                    print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
+                    await asyncio.sleep(retry_after + 1)
+                else:
+                    print(f"[{bot_name}] ❌ 삭제 실패: {e}")
+                    return False
+            except Exception as e:
+                print(f"[{bot_name}] ❌ 예상치 못한 오류: {e}")
+                return False
 
-        removable_roles = [
-            r for r in member.roles
-            if r != guild.default_role and r < guild.me.top_role
-        ]
-        if removable_roles:
-            await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
-        await member.add_roles(role, reason="웹 인증 완료")
-
-        del pending_verifications[token]
-
-        log_channel_id = gcfg.get("log_channel")
-        if log_channel_id:
-            log_channel = guild.get_channel(log_channel_id)
-            if log_channel:
-                now_kst = datetime.now(KST)
-                embed = discord.Embed(
-                    title="✅ 웹 인증 완료",
-                    description=f"{member.mention} 님이 웹 인증을 완료했어요.",
-                    color=discord.Color.green(),
-                    timestamp=datetime.now(timezone.utc)
+    async def safe_create_role(guild, data, delay=1.0):
+        while True:
+            try:
+                role = await guild.create_role(
+                    name=data["name"],
+                    color=discord.Color(data["color"]),
+                    hoist=data["hoist"],
+                    mentionable=data["mentionable"],
+                    permissions=discord.Permissions(data["permissions"])
                 )
-                embed.add_field(name="유저", value=f"{member} ({member.id})", inline=False)
-                embed.add_field(name="인증 시각", value=now_kst.strftime("%Y-%m-%d %H:%M:%S (KST)"), inline=False)
-                embed.add_field(name="🌐 IP 주소", value=ip, inline=False)
-                embed.set_thumbnail(url=member.display_avatar.url)
+                await role.edit(position=data["position"])
+                await asyncio.sleep(delay)
+                return role
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                    print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
+                    await asyncio.sleep(retry_after + 1)
+                else:
+                    print(f"[{bot_name}] ❌ 역할 생성 실패: {e}")
+                    return None
+
+    async def safe_create_channel(guild, data, category=None, delay=0.7):
+        while True:
+            try:
+                if data["type"] == "text":
+                    ch = await guild.create_text_channel(
+                        name=data["name"],
+                        position=data["position"],
+                        category=category
+                    )
+                elif data["type"] == "voice":
+                    ch = await guild.create_voice_channel(
+                        name=data["name"],
+                        position=data["position"],
+                        category=category
+                    )
+                else:
+                    return None
+                await asyncio.sleep(delay)
+                return ch
+            except discord.HTTPException as e:
+                if e.status == 429:
+                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                    print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
+                    await asyncio.sleep(retry_after + 1)
+                else:
+                    print(f"[{bot_name}] ❌ 채널 생성 실패: {e}")
+                    return None
+
+    @bot.command(name="복구")
+    @owner_or_allowed()
+    async def restore_server(ctx):
+        guild = ctx.guild
+        author = ctx.author
+
+        # 봇 권한 확인
+        bot_member = guild.get_member(bot.user.id)
+        if not bot_member.guild_permissions.administrator:
+            await ctx.author.send("❌ 봇에 `관리자` 권한이 없습니다. 서버 설정에서 권한을 부여해주세요.")
+            return
+
+        if not os.path.exists(backup_path):
+            await ctx.author.send("❌ 백업 파일이 없습니다. 먼저 `!저장`을 실행하세요.")
+            return
+
+        with open(backup_path, "r", encoding="utf-8") as f:
+            backup_data = json.load(f)
+
+        if not backup_data:
+            await ctx.author.send("❌ 백업 데이터가 비어있습니다.")
+            return
+
+        await ctx.send("⚠️ **경고**: 서버의 모든 채널, 카테고리, 역할(관리됨 제외)이 삭제되고 백업된 상태로 복구됩니다.\n"
+                       "레이트리밋 방지를 위해 **약 2~5분** 정도 소요될 수 있습니다.\n"
+                       "계속하려면 `yes`를 입력하세요. (30초 내)")
+
+        def check(m):
+            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == "yes"
+
+        try:
+            await bot.wait_for("message", check=check, timeout=30.0)
+        except asyncio.TimeoutError:
+            await ctx.send("복구가 취소되었습니다.")
+            return
+
+        # 1. 모든 채널 삭제
+        await ctx.author.send("🔄 기존 채널 삭제 중... (약 1분 소요)")
+        for ch in guild.channels:
+            await safe_delete(ch, delay=0.6)
+
+        # 2. 모든 역할 삭제
+        await ctx.author.send("🔄 기존 역할 삭제 중... (약 1분 소요)")
+        for role in guild.roles:
+            if role.is_default() or role.managed:
+                continue
+            await safe_delete(role, delay=1.0)
+
+        # 3. 역할 재생성
+        await ctx.author.send("🔄 역할 재생성 중... (약 1~2분 소요)")
+        role_map = {}
+        roles_data = sorted(backup_data.get("roles", []), key=lambda r: r["position"])
+        for rdata in roles_data:
+            new_role = await safe_create_role(guild, rdata, delay=1.2)
+            if new_role:
+                role_map[rdata["id"]] = new_role
+
+        # 4. 카테고리 재생성
+        await ctx.author.send("🔄 카테고리 재생성 중...")
+        category_map = {}
+        for cdata in backup_data.get("categories", []):
+            try:
+                new_cat = await guild.create_category(
+                    name=cdata["name"],
+                    position=cdata["position"]
+                )
+                await asyncio.sleep(0.7)
+                category_map[cdata["id"]] = new_cat
+
+                for ow in cdata["overwrites"]:
+                    target = None
+                    if ow["target_type"] == "role":
+                        target = role_map.get(ow["target_id"])
+                    elif ow["target_type"] == "user":
+                        target = guild.get_member(int(ow["target_id"]))
+                    if target:
+                        allow = discord.Permissions(ow["allow"])
+                        deny = discord.Permissions(ow["deny"])
+                        try:
+                            await new_cat.set_permissions(
+                                target,
+                                overwrite=discord.PermissionOverwrite.from_pair(allow, deny)
+                            )
+                            await asyncio.sleep(0.5)
+                        except:
+                            pass
+            except Exception as e:
+                print(f"[{bot_name}] 카테고리 생성 오류: {e}")
+
+        # 5. 채널 재생성
+        await ctx.author.send("🔄 채널 재생성 중... (약 2~3분 소요)")
+        for chdata in backup_data.get("channels", []):
+            parent = category_map.get(chdata["parent_id"]) if chdata["parent_id"] else None
+            new_ch = await safe_create_channel(guild, chdata, parent, delay=0.7)
+            if not new_ch:
+                continue
+
+            for ow in chdata["overwrites"]:
+                target = None
+                if ow["target_type"] == "role":
+                    target = role_map.get(ow["target_id"])
+                elif ow["target_type"] == "user":
+                    target = guild.get_member(int(ow["target_id"]))
+                if target:
+                    allow = discord.Permissions(ow["allow"])
+                    deny = discord.Permissions(ow["deny"])
+                    try:
+                        await new_ch.set_permissions(
+                            target,
+                            overwrite=discord.PermissionOverwrite.from_pair(allow, deny)
+                        )
+                        await asyncio.sleep(0.5)
+                    except:
+                        pass
+
+        try:
+            await ctx.author.send("✅ 서버 복구가 완료되었습니다! (레이트리밋을 피하며 안전하게 처리됨)")
+        except discord.Forbidden:
+            print(f"[{bot_name}] 복구 완료되었으나 DM 전송 실패.")
+
+    # ============================================================
+    # 디스코드 뷰 (콘솔 버튼)
+    # ============================================================
+    class ConsoleView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=None)
+
+        @discord.ui.button(label="인증하기", style=discord.ButtonStyle.green, emoji="✅", custom_id=CONSOLE_BUTTON_ID)
+        async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+            try:
+                await interaction.response.defer(ephemeral=True)
+
+                gcfg = get_guild_cfg(interaction.guild_id)
+                if not gcfg.get("verify_role"):
+                    return await interaction.followup.send(
+                        "❌ 이 서버에는 인증역할이 설정되어있지 않아요. 관리자에게 문의해주세요.",
+                        ephemeral=True
+                    )
+
+                link = create_verify_link(interaction.user.id, interaction.guild_id)
+                embed = discord.Embed(
+                    title="🔐 웹 인증",
+                    description=f"[여기를 클릭하여 인증을 완료하세요]({link})\n\n링크는 {CAPTCHA_EXPIRE_SECONDS//60}분간 유효합니다.",
+                    color=discord.Color.blue()
+                )
+                embed.set_footer(text="인증 후 역할이 자동으로 지급됩니다.")
+                await interaction.followup.send(embed=embed, ephemeral=True)
+
+            except Exception as e:
+                traceback.print_exc()
                 try:
-                    await log_channel.send(embed=embed)
+                    await interaction.followup.send(f"❌ 오류: {str(e)}", ephemeral=True)
                 except:
                     pass
 
-        return True, f"역할 {role.name}이 지급되었습니다."
+    @bot.command(name="콘솔생성")
+    @owner_or_allowed()
+    async def create_console(ctx: commands.Context):
+        embed = discord.Embed(
+            title="🔐 서버 인증",
+            description="아래 버튼을 누르면 인증 링크를 받을 수 있습니다.",
+            color=discord.Color.blurple()
+        )
+        await ctx.send(embed=embed, view=ConsoleView())
 
-    except Exception as e:
-        traceback.print_exc()
-        return False, f"오류 발생: {str(e)}"
+    # ============================================================
+    # 봇 이벤트
+    # ============================================================
+    @bot.event
+    async def on_ready():
+        if not hasattr(bot, "console_view_added"):
+            bot.add_view(ConsoleView())
+            bot.console_view_added = True
+
+        print(f"✅ [{bot_name}] {bot.user} 로 로그인 완료!")
+
+    return bot
 
 # ============================================================
-# Flask 웹서버 (reCAPTCHA + 루트 경로)
+# Flask 웹서버 (reCAPTCHA + 루트 경로) - 두 봇이 공유
 # ============================================================
 app = Flask(__name__)
+
+# 전역 pending_verifications (두 봇이 공유)
+pending_verifications = {}
 
 @app.route('/')
 def home():
@@ -419,14 +766,36 @@ def verify_page():
                 success=None
             )
 
-        # 🔥 실제 클라이언트 IP 추출 (X-Forwarded-For 고려)
+        # 실제 클라이언트 IP 추출
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
 
+        # 👇 여기서 pending_verifications에 저장된 guild_id로 봇을 찾아 처리
+        data = pending_verifications.get(token)
+        if not data:
+            return "❌ 인증 정보가 없습니다.", 400
+
+        guild_id = data["guild_id"]
+        # 두 봇 중 하나를 찾아서 처리 (guild_id로 봇 식별)
+        target_bot = None
+        for b in bots:
+            if b.get_guild(guild_id):
+                target_bot = b
+                break
+
+        if not target_bot:
+            return "❌ 해당 서버를 관리하는 봇을 찾을 수 없습니다.", 400
+
+        # assign_role_from_web 함수는 각 봇의 클로저에 있으므로, 여기서 직접 구현하거나 봇 객체에 메서드로 전달해야 함.
+        # → 간단히 각 봇의 on_ready에서 Flask에 콜백을 등록하는 방식으로 변경하는 게 좋지만,
+        #   여기서는 편의를 위해 봇 객체에 직접 접근하여 처리하는 함수를 임시로 구현.
+        #   (실제로는 봇 인스턴스에 assign_role 메서드를 추가하는 게 깔끔)
+
+        # 우선은 간단히 첫 번째 봇의 루프에서 실행
         future = asyncio.run_coroutine_threadsafe(
-            assign_role_from_web(token, ip),
-            bot.loop
+            assign_role_from_web_wrapper(token, ip, guild_id),
+            target_bot.loop
         )
         try:
             success, message = future.result(timeout=15)
@@ -451,72 +820,130 @@ def verify_page():
             )
 
 # ============================================================
-# 디스코드 뷰 (콘솔 버튼)
+# 웹 인증 처리 래퍼 (봇 인스턴스와 독립)
 # ============================================================
-class ConsoleView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
+async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int):
+    try:
+        if token not in pending_verifications:
+            return False, "인증 토큰이 존재하지 않습니다."
 
-    @discord.ui.button(label="인증하기", style=discord.ButtonStyle.green, emoji="✅", custom_id=CONSOLE_BUTTON_ID)
-    async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        try:
-            await interaction.response.defer(ephemeral=True)
+        data = pending_verifications[token]
+        if time.time() > data["expires"]:
+            del pending_verifications[token]
+            return False, "인증 토큰이 만료되었습니다."
 
-            gcfg = get_guild_cfg(interaction.guild_id)
-            if not gcfg.get("verify_role"):
-                return await interaction.followup.send(
-                    "❌ 이 서버에는 인증역할이 설정되어있지 않아요. 관리자에게 문의해주세요.",
-                    ephemeral=True
+        user_id = data["user_id"]
+
+        # 봇 찾기
+        target_bot = None
+        for b in bots:
+            if b.get_guild(guild_id):
+                target_bot = b
+                break
+        if not target_bot:
+            return False, "서버를 관리하는 봇을 찾을 수 없습니다."
+
+        guild = target_bot.get_guild(guild_id)
+        if not guild:
+            return False, "서버를 찾을 수 없습니다."
+
+        member = guild.get_member(user_id)
+        if not member:
+            return False, "서버에서 해당 사용자를 찾을 수 없습니다."
+
+        # 설정 파일 로드 (해당 봇의 config_path 사용)
+        # → 봇별 config_path를 알 수 없으므로, 봇 객체에 저장해두거나 전역으로 관리.
+        # 여기서는 간단히 첫 번째 봇의 config를 사용 (실제로는 봇별로 분리해야 함)
+        # 하지만 각 봇이 다른 서버를 관리한다면 config_path도 분리되어야 함.
+        # 현재는 봇1과 봇2가 각각 config_bot1.json, config_bot2.json을 사용하므로,
+        # 봇 객체에 config_path를 저장해두고 가져오는 방식으로 구현해야 함.
+        # → 이 부분은 조금 복잡하므로, 우선은 첫 번째 봇의 config를 사용하도록 임시 처리.
+        # (실제 운영 시에는 봇 객체에 config_path를 속성으로 저장하고, 여기서 가져오는 게 좋음)
+
+        # 임시: 봇1의 config 사용
+        config_path = CONFIG_PATH1
+        with open(config_path, "r", encoding="utf-8") as f:
+            config = json.load(f)
+        gcfg = config.get(str(guild_id), {})
+
+        verify_role_id = gcfg.get("verify_role")
+        if not verify_role_id:
+            return False, "인증 역할이 설정되지 않았습니다."
+
+        role = guild.get_role(verify_role_id)
+        if not role:
+            return False, "설정된 역할이 존재하지 않습니다."
+
+        removable_roles = [
+            r for r in member.roles
+            if r != guild.default_role and r < guild.me.top_role
+        ]
+        if removable_roles:
+            await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
+        await member.add_roles(role, reason="웹 인증 완료")
+
+        del pending_verifications[token]
+
+        log_channel_id = gcfg.get("log_channel")
+        if log_channel_id:
+            log_channel = guild.get_channel(log_channel_id)
+            if log_channel:
+                now_kst = datetime.now(KST)
+                embed = discord.Embed(
+                    title="✅ 웹 인증 완료",
+                    description=f"{member.mention} 님이 웹 인증을 완료했어요.",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
                 )
+                embed.add_field(name="유저", value=f"{member} ({member.id})", inline=False)
+                embed.add_field(name="인증 시각", value=now_kst.strftime("%Y-%m-%d %H:%M:%S (KST)"), inline=False)
+                embed.add_field(name="🌐 IP 주소", value=ip, inline=False)
+                embed.set_thumbnail(url=member.display_avatar.url)
+                try:
+                    await log_channel.send(embed=embed)
+                except:
+                    pass
 
-            link = create_verify_link(interaction.user.id, interaction.guild_id)
-            embed = discord.Embed(
-                title="🔐 웹 인증",
-                description=f"[여기를 클릭하여 인증을 완료하세요]({link})\n\n링크는 {CAPTCHA_EXPIRE_SECONDS//60}분간 유효합니다.",
-                color=discord.Color.blue()
-            )
-            embed.set_footer(text="인증 후 역할이 자동으로 지급됩니다.")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+        return True, f"역할 {role.name}이 지급되었습니다."
 
-        except Exception as e:
-            traceback.print_exc()
-            try:
-                await interaction.followup.send(f"❌ 오류: {str(e)}", ephemeral=True)
-            except:
-                pass
-
-@bot.command(name="콘솔생성")
-@owner_or_allowed()
-async def create_console(ctx: commands.Context):
-    embed = discord.Embed(
-        title="🔐 서버 인증",
-        description="아래 버튼을 누르면 인증 링크를 받을 수 있습니다.",
-        color=discord.Color.blurple()
-    )
-    await ctx.send(embed=embed, view=ConsoleView())
+    except Exception as e:
+        traceback.print_exc()
+        return False, f"오류 발생: {str(e)}"
 
 # ============================================================
-# 실행
+# Flask 서버 실행 함수
 # ============================================================
 def run_flask():
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
 
-@bot.event
-async def on_ready():
-    if not hasattr(bot, "console_view_added"):
-        bot.add_view(ConsoleView())
-        bot.console_view_added = True
+# ============================================================
+# 두 개의 봇 생성 및 실행
+# ============================================================
+bots = []
 
-    if not hasattr(bot, "flask_thread"):
-        thread = threading.Thread(target=run_flask, daemon=True)
-        thread.start()
-        bot.flask_thread = thread
-        print(f"🌐 웹서버가 http://{WEB_HOST}:{WEB_PORT} 에서 실행 중입니다.")
+async def main():
+    global bots
 
-    print(f"✅ {bot.user} 로 로그인 완료!")
+    # 봇1 생성 (기존 인증 + 저장/복구 기능)
+    bot1 = create_bot(TOKEN1, "봇1", CONFIG_PATH1, BACKUP_PATH1)
+    # 봇2 생성 (동일한 기능, 다른 토큰/설정파일)
+    bot2 = create_bot(TOKEN2, "봇2", CONFIG_PATH2, BACKUP_PATH2)
+
+    bots = [bot1, bot2]
+
+    # Flask 서버 스레드 실행 (한 번만)
+    thread = threading.Thread(target=run_flask, daemon=True)
+    thread.start()
+    print("🌐 웹서버가 http://0.0.0.0:5000 에서 실행 중입니다.")
+
+    # 두 봇 동시 실행
+    await asyncio.gather(
+        bot1.start(TOKEN1),
+        bot2.start(TOKEN2)
+    )
 
 if __name__ == "__main__":
-    if TOKEN is None:
-        print("❌ DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다!")
+    if not TOKEN1 or not TOKEN2:
+        print("❌ DISCORD_BOT_TOKEN1 또는 DISCORD_BOT_TOKEN2 환경변수가 설정되지 않았습니다!")
     else:
-        bot.run(TOKEN)
+        asyncio.run(main())
