@@ -50,6 +50,11 @@ def create_bot(token, bot_name, config_path, backup_path):
 
     bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
+    # 봇 객체에 설정 파일 경로 저장 (웹 인증에서 사용)
+    bot.config_path = config_path
+    bot.backup_path = backup_path
+    bot.bot_name = bot_name
+
     # ============================================================
     # 서버별 설정 저장/로드 (파일 분리)
     # ============================================================
@@ -71,18 +76,25 @@ def create_bot(token, bot_name, config_path, backup_path):
     pending_verifications = {}
 
     # ============================================================
-    # 권한 체크 (서버 소유자 + 허용된 사용자)
+    # 권한 체크 (서버 소유자 + 허용된 사용자 + 유저등록)
     # ============================================================
-    def owner_or_allowed():
-        async def predicate(ctx: commands.Context) -> bool:
-            if ctx.guild is None:
-                raise commands.NoPrivateMessage("서버 안에서만 사용할 수 있어요.")
-            if ctx.author.id == ctx.guild.owner_id:
-                return True
-            if ctx.author.id in ALLOWED_USER_IDS:
-                return True
-            raise commands.MissingPermissions(["서버 소유자 또는 허용된 사용자"])
-        return commands.check(predicate)
+    def is_authorized(ctx):
+        # 1) 서버 소유자
+        if ctx.guild and ctx.author.id == ctx.guild.owner_id:
+            return True
+        # 2) 하드코딩된 허용 유저
+        if ctx.author.id in ALLOWED_USER_IDS:
+            return True
+        # 3) !유저등록으로 등록된 유저
+        cfg = load_config()
+        authorized_list = cfg.get("authorized_users", [])
+        if ctx.author.id in authorized_list:
+            return True
+        return False
+
+    def is_bot_owner(ctx):
+        # 봇 소유자(하드코딩)만 허용 (유저등록 명령어용)
+        return ctx.author.id in ALLOWED_USER_IDS
 
     @bot.event
     async def on_command_error(ctx, error):
@@ -100,10 +112,27 @@ def create_bot(token, bot_name, config_path, backup_path):
             raise error
 
     # ============================================================
+    # 📌 !유저등록 (봇 소유자만 실행 가능)
+    # ============================================================
+    @bot.command(name="유저등록")
+    @commands.check(is_bot_owner)
+    async def register_user(ctx, member: discord.Member):
+        """봇 소유자가 특정 유저에게 !저장/!복구 권한을 부여"""
+        cfg = load_config()
+        if "authorized_users" not in cfg:
+            cfg["authorized_users"] = []
+        if member.id not in cfg["authorized_users"]:
+            cfg["authorized_users"].append(member.id)
+            save_config(cfg)
+            await ctx.send(f"✅ {member.mention} 님이 `!저장` / `!복구` 사용 권한을 얻었습니다.")
+        else:
+            await ctx.send(f"⚠️ {member.mention} 님은 이미 등록되어 있습니다.")
+
+    # ============================================================
     # 기존 명령어 (인증역할, 로그채널, 인증채널, 예외채널, 콘솔생성)
     # ============================================================
     @bot.command(name="인증역할")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def set_verify_role(ctx: commands.Context, role: discord.Role):
         gcfg = get_guild_cfg(ctx.guild.id)
         gcfg["verify_role"] = role.id
@@ -111,7 +140,7 @@ def create_bot(token, bot_name, config_path, backup_path):
         await ctx.send(f"✅ 인증 통과 시 지급할 역할을 {role.mention} 로 설정했어요.")
 
     @bot.command(name="로그채널")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
         gcfg = get_guild_cfg(ctx.guild.id)
         gcfg["log_channel"] = channel.id
@@ -119,7 +148,7 @@ def create_bot(token, bot_name, config_path, backup_path):
         await ctx.send(f"✅ 인증 로그를 {channel.mention} 채널에 전송하도록 설정했어요.")
 
     @bot.command(name="인증채널")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def set_auth_channel(ctx, *, args: str):
         role_match = re.search(r'<@&(\d+)>', args)
         if not role_match:
@@ -155,7 +184,7 @@ def create_bot(token, bot_name, config_path, backup_path):
         )
 
     @bot.command(name="예외채널")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def set_exception_channel(ctx, *, category_name: str):
         category = discord.utils.get(ctx.guild.categories, name=category_name)
         if not category:
@@ -250,84 +279,20 @@ def create_bot(token, bot_name, config_path, backup_path):
     def create_verify_link(user_id: int, guild_id: int) -> str:
         token = generate_token()
         expires = time.time() + CAPTCHA_EXPIRE_SECONDS
-        pending_verifications[token] = {
+        # 전역 pending_verifications 사용
+        global pending_verifications_global
+        pending_verifications_global[token] = {
             "user_id": user_id,
             "guild_id": guild_id,
             "expires": expires
         }
         return f"{BASE_URL}/verify?token={token}"
 
-    async def assign_role_from_web(token: str, ip: str):
-        try:
-            if token not in pending_verifications:
-                return False, "인증 토큰이 존재하지 않습니다."
-
-            data = pending_verifications[token]
-            if time.time() > data["expires"]:
-                del pending_verifications[token]
-                return False, "인증 토큰이 만료되었습니다."
-
-            user_id = data["user_id"]
-            guild_id = data["guild_id"]
-
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                return False, "서버를 찾을 수 없습니다."
-
-            member = guild.get_member(user_id)
-            if not member:
-                return False, "서버에서 해당 사용자를 찾을 수 없습니다."
-
-            gcfg = get_guild_cfg(guild_id)
-            verify_role_id = gcfg.get("verify_role")
-            if not verify_role_id:
-                return False, "인증 역할이 설정되지 않았습니다."
-
-            role = guild.get_role(verify_role_id)
-            if not role:
-                return False, "설정된 역할이 존재하지 않습니다."
-
-            removable_roles = [
-                r for r in member.roles
-                if r != guild.default_role and r < guild.me.top_role
-            ]
-            if removable_roles:
-                await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
-            await member.add_roles(role, reason="웹 인증 완료")
-
-            del pending_verifications[token]
-
-            log_channel_id = gcfg.get("log_channel")
-            if log_channel_id:
-                log_channel = guild.get_channel(log_channel_id)
-                if log_channel:
-                    now_kst = datetime.now(KST)
-                    embed = discord.Embed(
-                        title="✅ 웹 인증 완료",
-                        description=f"{member.mention} 님이 웹 인증을 완료했어요.",
-                        color=discord.Color.green(),
-                        timestamp=datetime.now(timezone.utc)
-                    )
-                    embed.add_field(name="유저", value=f"{member} ({member.id})", inline=False)
-                    embed.add_field(name="인증 시각", value=now_kst.strftime("%Y-%m-%d %H:%M:%S (KST)"), inline=False)
-                    embed.add_field(name="🌐 IP 주소", value=ip, inline=False)
-                    embed.set_thumbnail(url=member.display_avatar.url)
-                    try:
-                        await log_channel.send(embed=embed)
-                    except:
-                        pass
-
-            return True, f"역할 {role.name}이 지급되었습니다."
-
-        except Exception as e:
-            traceback.print_exc()
-            return False, f"오류 발생: {str(e)}"
-
     # ============================================================
-    # 📌 새로운 명령어: !저장 (서버 구조 백업)
+    # 📌 !저장 (서버 구조 백업)
     # ============================================================
     @bot.command(name="저장")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def save_server(ctx):
         guild = ctx.guild
         backup_data = {}
@@ -417,7 +382,7 @@ def create_bot(token, bot_name, config_path, backup_path):
         await ctx.send("✅ 서버 구조가 성공적으로 백업되었습니다.")
 
     # ============================================================
-    # 📌 새로운 명령어: !복구 (레이트리밋 방지 포함)
+    # 📌 !복구 (레이트리밋 방지 포함)
     # ============================================================
     async def safe_delete(obj, delay=0.8):
         while True:
@@ -488,7 +453,7 @@ def create_bot(token, bot_name, config_path, backup_path):
                     return None
 
     @bot.command(name="복구")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def restore_server(ctx):
         guild = ctx.guild
         author = ctx.author
@@ -643,7 +608,7 @@ def create_bot(token, bot_name, config_path, backup_path):
                     pass
 
     @bot.command(name="콘솔생성")
-    @owner_or_allowed()
+    @commands.check(is_authorized)
     async def create_console(ctx: commands.Context):
         embed = discord.Embed(
             title="🔐 서버 인증",
@@ -671,7 +636,7 @@ def create_bot(token, bot_name, config_path, backup_path):
 app = Flask(__name__)
 
 # 전역 pending_verifications (두 봇이 공유)
-pending_verifications = {}
+pending_verifications_global = {}
 
 @app.route('/')
 def home():
@@ -734,7 +699,7 @@ CAPTCHA_PAGE = """
 @app.route('/verify', methods=['GET', 'POST'])
 def verify_page():
     token = request.args.get('token') or request.form.get('token')
-    if not token or token not in pending_verifications:
+    if not token or token not in pending_verifications_global:
         return "❌ 유효하지 않거나 만료된 인증 링크입니다.", 400
 
     if request.method == 'GET':
@@ -771,13 +736,15 @@ def verify_page():
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
 
-        # 👇 여기서 pending_verifications에 저장된 guild_id로 봇을 찾아 처리
-        data = pending_verifications.get(token)
+        # pending 데이터에서 guild_id와 user_id 추출
+        data = pending_verifications_global.get(token)
         if not data:
             return "❌ 인증 정보가 없습니다.", 400
 
         guild_id = data["guild_id"]
-        # 두 봇 중 하나를 찾아서 처리 (guild_id로 봇 식별)
+        user_id = data["user_id"]
+
+        # 해당 guild_id를 관리하는 봇 찾기
         target_bot = None
         for b in bots:
             if b.get_guild(guild_id):
@@ -787,14 +754,9 @@ def verify_page():
         if not target_bot:
             return "❌ 해당 서버를 관리하는 봇을 찾을 수 없습니다.", 400
 
-        # assign_role_from_web 함수는 각 봇의 클로저에 있으므로, 여기서 직접 구현하거나 봇 객체에 메서드로 전달해야 함.
-        # → 간단히 각 봇의 on_ready에서 Flask에 콜백을 등록하는 방식으로 변경하는 게 좋지만,
-        #   여기서는 편의를 위해 봇 객체에 직접 접근하여 처리하는 함수를 임시로 구현.
-        #   (실제로는 봇 인스턴스에 assign_role 메서드를 추가하는 게 깔끔)
-
-        # 우선은 간단히 첫 번째 봇의 루프에서 실행
+        # 봇의 config_path를 사용하여 역할 부여
         future = asyncio.run_coroutine_threadsafe(
-            assign_role_from_web_wrapper(token, ip, guild_id),
+            assign_role_from_web_wrapper(token, ip, guild_id, user_id, target_bot),
             target_bot.loop
         )
         try:
@@ -820,30 +782,19 @@ def verify_page():
             )
 
 # ============================================================
-# 웹 인증 처리 래퍼 (봇 인스턴스와 독립)
+# 웹 인증 처리 래퍼 (봇 인스턴스 사용)
 # ============================================================
-async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int):
+async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int, user_id: int, bot_instance):
     try:
-        if token not in pending_verifications:
+        if token not in pending_verifications_global:
             return False, "인증 토큰이 존재하지 않습니다."
 
-        data = pending_verifications[token]
+        data = pending_verifications_global[token]
         if time.time() > data["expires"]:
-            del pending_verifications[token]
+            del pending_verifications_global[token]
             return False, "인증 토큰이 만료되었습니다."
 
-        user_id = data["user_id"]
-
-        # 봇 찾기
-        target_bot = None
-        for b in bots:
-            if b.get_guild(guild_id):
-                target_bot = b
-                break
-        if not target_bot:
-            return False, "서버를 관리하는 봇을 찾을 수 없습니다."
-
-        guild = target_bot.get_guild(guild_id)
+        guild = bot_instance.get_guild(guild_id)
         if not guild:
             return False, "서버를 찾을 수 없습니다."
 
@@ -851,17 +802,8 @@ async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int):
         if not member:
             return False, "서버에서 해당 사용자를 찾을 수 없습니다."
 
-        # 설정 파일 로드 (해당 봇의 config_path 사용)
-        # → 봇별 config_path를 알 수 없으므로, 봇 객체에 저장해두거나 전역으로 관리.
-        # 여기서는 간단히 첫 번째 봇의 config를 사용 (실제로는 봇별로 분리해야 함)
-        # 하지만 각 봇이 다른 서버를 관리한다면 config_path도 분리되어야 함.
-        # 현재는 봇1과 봇2가 각각 config_bot1.json, config_bot2.json을 사용하므로,
-        # 봇 객체에 config_path를 저장해두고 가져오는 방식으로 구현해야 함.
-        # → 이 부분은 조금 복잡하므로, 우선은 첫 번째 봇의 config를 사용하도록 임시 처리.
-        # (실제 운영 시에는 봇 객체에 config_path를 속성으로 저장하고, 여기서 가져오는 게 좋음)
-
-        # 임시: 봇1의 config 사용
-        config_path = CONFIG_PATH1
+        # 해당 봇의 설정 파일 읽기
+        config_path = bot_instance.config_path
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
         gcfg = config.get(str(guild_id), {})
@@ -882,7 +824,7 @@ async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int):
             await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
         await member.add_roles(role, reason="웹 인증 완료")
 
-        del pending_verifications[token]
+        del pending_verifications_global[token]
 
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
