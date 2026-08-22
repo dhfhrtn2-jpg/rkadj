@@ -17,16 +17,14 @@ from flask import Flask, request, render_template_string
 # ============================================================
 # 공통 설정 (환경변수)
 # ============================================================
-TOKEN1 = os.getenv("DISCORD_BOT_TOKEN1")   # 첫 번째 봇 토큰 (복구봇)
-TOKEN2 = os.getenv("DISCORD_BOT_TOKEN2")   # 두 번째 봇 토큰 (인증봇)
+TOKEN1 = os.getenv("DISCORD_BOT_TOKEN1")   # 복구봇
+TOKEN2 = os.getenv("DISCORD_BOT_TOKEN2")   # 인증봇
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
-PREFIX = "!"
 CONFIG_PATH1 = "config_bot1.json"
 CONFIG_PATH2 = "config_bot2.json"
 BACKUP_PATH1 = "backup_bot1.json"
 BACKUP_PATH2 = "backup_bot2.json"
 CAPTCHA_EXPIRE_SECONDS = 600
-CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
 
 RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY")
@@ -40,18 +38,22 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 5000
 
 # ============================================================
-# 봇 팩토리 함수 (include_backup 옵션 추가)
+# 봇 팩토리 함수 (prefix, 고유 custom_id 지원)
 # ============================================================
-def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
+def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup=True):
     intents = discord.Intents.default()
     intents.members = True
     intents.message_content = True
 
-    bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+    bot = commands.Bot(command_prefix=prefix, intents=intents, help_command=None)
 
     bot.config_path = config_path
     bot.backup_path = backup_path
     bot.bot_name = bot_name
+    bot.prefix = prefix
+
+    # 고유한 버튼 custom_id 생성
+    bot.custom_console_button_id = f"verify_console_{bot_name}"
 
     # ============================================================
     # 서버별 설정 저장/로드
@@ -70,8 +72,6 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
 
     def get_guild_cfg(guild_id: int) -> dict:
         return config.setdefault(str(guild_id), {})
-
-    pending_verifications = {}
 
     # ============================================================
     # 권한 체크
@@ -103,7 +103,9 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
         elif isinstance(error, commands.MissingRequiredArgument):
             await ctx.send("❌ 필요한 값이 빠졌어요. 사용법을 확인해주세요.")
         else:
-            raise error
+            # 예상치 못한 에러는 로그에 출력하고 사용자에게 알림
+            traceback.print_exc()
+            await ctx.send(f"❌ 오류가 발생했습니다: {str(error)}")
 
     # ============================================================
     # 📌 !유저등록 (봇 소유자만)
@@ -117,12 +119,12 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
         if member.id not in cfg["authorized_users"]:
             cfg["authorized_users"].append(member.id)
             save_config(cfg)
-            await ctx.send(f"✅ {member.mention} 님이 `!저장` / `!복구` 사용 권한을 얻었습니다.")
+            await ctx.send(f"✅ {member.mention} 님이 `{prefix}저장` / `{prefix}복구` 사용 권한을 얻었습니다.")
         else:
             await ctx.send(f"⚠️ {member.mention} 님은 이미 등록되어 있습니다.")
 
     # ============================================================
-    # 기존 명령어 (인증역할, 로그채널, 인증채널, 예외채널, 콘솔생성)
+    # 인증 관련 명령어 (인증역할, 로그채널, 인증채널, 예외채널, 콘솔생성)
     # ============================================================
     @bot.command(name="인증역할")
     @commands.check(is_authorized)
@@ -145,7 +147,7 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
     async def set_auth_channel(ctx, *, args: str):
         role_match = re.search(r'<@&(\d+)>', args)
         if not role_match:
-            await ctx.send("❌ 역할을 멘션해주세요. 예: `!인증채널 카테고리이름 @역할`")
+            await ctx.send(f"❌ 역할을 멘션해주세요. 예: `{prefix}인증채널 카테고리이름 @역할`")
             return
         role_id = int(role_match.group(1))
         role = ctx.guild.get_role(role_id)
@@ -196,7 +198,7 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
 
         allowed_role_id = gcfg.get("allowed_role_id")
         if not allowed_role_id:
-            await ctx.send("❌ 먼저 `!인증채널`로 인증 역할을 설정해주세요.")
+            await ctx.send(f"❌ 먼저 `{prefix}인증채널`로 인증 역할을 설정해주세요.")
             return
 
         role = ctx.guild.get_role(allowed_role_id)
@@ -277,12 +279,12 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
             "user_id": user_id,
             "guild_id": guild_id,
             "expires": expires,
-            "bot_name": bot_name  # ✅ 봇 이름 저장
+            "bot_name": bot_name
         }
         return f"{BASE_URL}/verify?token={token}"
 
     # ============================================================
-    # 📌 !저장 / !복구 (include_backup이 True일 때만 등록)
+    # 📌 !저장 / !복구 (include_backup이 True일 때만)
     # ============================================================
     if include_backup:
         @bot.command(name="저장")
@@ -555,16 +557,17 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
                 print(f"[{bot_name}] 복구 완료되었으나 DM 전송 실패.")
 
     # ============================================================
-    # 디스코드 뷰 (콘솔 버튼) - 봇 이름 전달
+    # 디스코드 뷰 (콘솔 버튼) - 고유 custom_id 사용
     # ============================================================
     class ConsoleView(discord.ui.View):
-        def __init__(self, bot_name):
+        def __init__(self, custom_id):
             super().__init__(timeout=None)
-            self.bot_name = bot_name
+            self.custom_id = custom_id
 
         @discord.ui.button(label="인증하기", style=discord.ButtonStyle.green, emoji="✅", custom_id=CONSOLE_BUTTON_ID)
         async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
             try:
+                # 먼저 지연 응답 (3초 제한 회피)
                 await interaction.response.defer(ephemeral=True)
 
                 gcfg = get_guild_cfg(interaction.guild_id)
@@ -586,6 +589,7 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
             except Exception as e:
                 traceback.print_exc()
                 try:
+                    # 이미 defer가 호출되었으므로 followup 사용
                     await interaction.followup.send(f"❌ 오류: {str(e)}", ephemeral=True)
                 except:
                     pass
@@ -595,21 +599,25 @@ def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
     async def create_console(ctx: commands.Context):
         embed = discord.Embed(
             title="🔐 서버 인증",
-            description="아래 버튼을 누르면 인증 링크를 받을 수 있습니다.",
+            description=f"아래 버튼을 누르면 인증 링크를 받을 수 있습니다.",
             color=discord.Color.blurple()
         )
-        await ctx.send(embed=embed, view=ConsoleView(bot_name))  # ✅ 봇 이름 전달
+        # 고유한 custom_id를 가진 뷰 생성
+        view = ConsoleView(bot.custom_console_button_id)
+        await ctx.send(embed=embed, view=view)
 
     # ============================================================
     # 봇 이벤트
     # ============================================================
     @bot.event
     async def on_ready():
+        # persistent view 등록 (재시작 후에도 버튼 동작)
         if not hasattr(bot, "console_view_added"):
-            bot.add_view(ConsoleView(bot_name))
+            view = ConsoleView(bot.custom_console_button_id)
+            bot.add_view(view)
             bot.console_view_added = True
 
-        print(f"✅ [{bot_name}] {bot.user} 로 로그인 완료!")
+        print(f"✅ [{bot_name}] {bot.user} 로 로그인 완료! (접두사: {prefix})")
 
     return bot
 
@@ -841,10 +849,25 @@ bots = []
 async def main():
     global bots
 
-    # 복구봇 (백업 기능 포함)
-    bot1 = create_bot(TOKEN1, "복구봇", CONFIG_PATH1, BACKUP_PATH1, include_backup=True)
-    # 인증봇 (백업 기능 제외, 오직 인증만)
-    bot2 = create_bot(TOKEN2, "인증봇", CONFIG_PATH2, BACKUP_PATH2, include_backup=False)
+    # 복구봇: 접두사 !, 백업 기능 포함
+    bot1 = create_bot(
+        token=TOKEN1,
+        bot_name="복구봇",
+        config_path=CONFIG_PATH1,
+        backup_path=BACKUP_PATH1,
+        prefix="!",
+        include_backup=True
+    )
+
+    # 인증봇: 접두사 ?, 백업 기능 제외 (오직 인증)
+    bot2 = create_bot(
+        token=TOKEN2,
+        bot_name="인증봇",
+        config_path=CONFIG_PATH2,
+        backup_path=BACKUP_PATH2,
+        prefix="?",
+        include_backup=False
+    )
 
     bots = [bot1, bot2]
 
