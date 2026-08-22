@@ -590,14 +590,13 @@ def create_bot(token, bot_name, config_path, backup_path, bot_role):
             @discord.ui.button(label="인증하기", style=discord.ButtonStyle.green, emoji="✅", custom_id=CONSOLE_BUTTON_ID)
             async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
                 try:
-                    await interaction.response.defer(ephemeral=True)
-
                     gcfg = get_guild_cfg(interaction.guild_id)
                     if not gcfg.get("verify_role"):
-                        return await interaction.followup.send(
+                        await interaction.response.send_message(
                             "❌ 이 서버에는 인증역할이 설정되어있지 않아요. 관리자에게 문의해주세요.",
                             ephemeral=True
                         )
+                        return
 
                     link = create_verify_link(interaction.user.id, interaction.guild_id)
                     embed = discord.Embed(
@@ -606,12 +605,12 @@ def create_bot(token, bot_name, config_path, backup_path, bot_role):
                         color=discord.Color.blue()
                     )
                     embed.set_footer(text="인증 후 역할이 자동으로 지급됩니다.")
-                    await interaction.followup.send(embed=embed, ephemeral=True)
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
 
                 except Exception as e:
                     traceback.print_exc()
                     try:
-                        await interaction.followup.send(f"❌ 오류: {str(e)}", ephemeral=True)
+                        await interaction.response.send_message(f"❌ 오류: {str(e)}", ephemeral=True)
                     except:
                         pass
 
