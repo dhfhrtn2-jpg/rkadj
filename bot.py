@@ -17,8 +17,8 @@ from flask import Flask, request, render_template_string
 # ============================================================
 # 공통 설정 (환경변수)
 # ============================================================
-TOKEN1 = os.getenv("DISCORD_BOT_TOKEN1")   # 첫 번째 봇 토큰
-TOKEN2 = os.getenv("DISCORD_BOT_TOKEN2")   # 두 번째 봇 토큰
+TOKEN1 = os.getenv("DISCORD_BOT_TOKEN1")   # 첫 번째 봇 토큰 (복구봇)
+TOKEN2 = os.getenv("DISCORD_BOT_TOKEN2")   # 두 번째 봇 토큰 (인증봇)
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 PREFIX = "!"
 CONFIG_PATH1 = "config_bot1.json"
@@ -29,7 +29,6 @@ CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
 
-# 🔐 reCAPTCHA 키 (환경변수)
 RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY")
 RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY")
 
@@ -41,22 +40,21 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = 5000
 
 # ============================================================
-# 봇 팩토리 함수 (각 봇별로 독립적인 설정/백업 파일 사용)
+# 봇 팩토리 함수 (include_backup 옵션 추가)
 # ============================================================
-def create_bot(token, bot_name, config_path, backup_path):
+def create_bot(token, bot_name, config_path, backup_path, include_backup=True):
     intents = discord.Intents.default()
     intents.members = True
     intents.message_content = True
 
     bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-    # 봇 객체에 설정 파일 경로 저장 (웹 인증에서 사용)
     bot.config_path = config_path
     bot.backup_path = backup_path
     bot.bot_name = bot_name
 
     # ============================================================
-    # 서버별 설정 저장/로드 (파일 분리)
+    # 서버별 설정 저장/로드
     # ============================================================
     def load_config():
         if os.path.exists(config_path):
@@ -76,16 +74,13 @@ def create_bot(token, bot_name, config_path, backup_path):
     pending_verifications = {}
 
     # ============================================================
-    # 권한 체크 (서버 소유자 + 허용된 사용자 + 유저등록)
+    # 권한 체크
     # ============================================================
     def is_authorized(ctx):
-        # 1) 서버 소유자
         if ctx.guild and ctx.author.id == ctx.guild.owner_id:
             return True
-        # 2) 하드코딩된 허용 유저
         if ctx.author.id in ALLOWED_USER_IDS:
             return True
-        # 3) !유저등록으로 등록된 유저
         cfg = load_config()
         authorized_list = cfg.get("authorized_users", [])
         if ctx.author.id in authorized_list:
@@ -93,7 +88,6 @@ def create_bot(token, bot_name, config_path, backup_path):
         return False
 
     def is_bot_owner(ctx):
-        # 봇 소유자(하드코딩)만 허용 (유저등록 명령어용)
         return ctx.author.id in ALLOWED_USER_IDS
 
     @bot.event
@@ -112,12 +106,11 @@ def create_bot(token, bot_name, config_path, backup_path):
             raise error
 
     # ============================================================
-    # 📌 !유저등록 (봇 소유자만 실행 가능)
+    # 📌 !유저등록 (봇 소유자만)
     # ============================================================
     @bot.command(name="유저등록")
     @commands.check(is_bot_owner)
     async def register_user(ctx, member: discord.Member):
-        """봇 소유자가 특정 유저에게 !저장/!복구 권한을 부여"""
         cfg = load_config()
         if "authorized_users" not in cfg:
             cfg["authorized_users"] = []
@@ -229,7 +222,7 @@ def create_bot(token, bot_name, config_path, backup_path):
         )
 
     # ============================================================
-    # 권한 설정 헬퍼 함수
+    # 권한 설정 헬퍼
     # ============================================================
     async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
         role = guild.get_role(allowed_role_id)
@@ -271,7 +264,7 @@ def create_bot(token, bot_name, config_path, backup_path):
                             pass
 
     # ============================================================
-    # 웹 인증 관련
+    # 웹 인증 관련 (봇 이름 저장)
     # ============================================================
     def generate_token() -> str:
         return ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -279,77 +272,44 @@ def create_bot(token, bot_name, config_path, backup_path):
     def create_verify_link(user_id: int, guild_id: int) -> str:
         token = generate_token()
         expires = time.time() + CAPTCHA_EXPIRE_SECONDS
-        # 전역 pending_verifications 사용
         global pending_verifications_global
         pending_verifications_global[token] = {
             "user_id": user_id,
             "guild_id": guild_id,
-            "expires": expires
+            "expires": expires,
+            "bot_name": bot_name  # ✅ 봇 이름 저장
         }
         return f"{BASE_URL}/verify?token={token}"
 
     # ============================================================
-    # 📌 !저장 (서버 구조 백업)
+    # 📌 !저장 / !복구 (include_backup이 True일 때만 등록)
     # ============================================================
-    @bot.command(name="저장")
-    @commands.check(is_authorized)
-    async def save_server(ctx):
-        guild = ctx.guild
-        backup_data = {}
+    if include_backup:
+        @bot.command(name="저장")
+        @commands.check(is_authorized)
+        async def save_server(ctx):
+            guild = ctx.guild
+            backup_data = {}
 
-        # 역할 저장
-        roles_data = []
-        for role in guild.roles:
-            if role.is_default() or role.managed:
-                continue
-            roles_data.append({
-                "id": str(role.id),
-                "name": role.name,
-                "color": role.color.value,
-                "hoist": role.hoist,
-                "mentionable": role.mentionable,
-                "permissions": role.permissions.value,
-                "position": role.position
-            })
-        backup_data["roles"] = roles_data
+            roles_data = []
+            for role in guild.roles:
+                if role.is_default() or role.managed:
+                    continue
+                roles_data.append({
+                    "id": str(role.id),
+                    "name": role.name,
+                    "color": role.color.value,
+                    "hoist": role.hoist,
+                    "mentionable": role.mentionable,
+                    "permissions": role.permissions.value,
+                    "position": role.position
+                })
+            backup_data["roles"] = roles_data
 
-        # 카테고리 저장
-        categories_data = []
-        for cat in guild.categories:
-            overwrites = []
-            for target, overwrite in cat.overwrites.items():
-                if isinstance(target, discord.Role):
-                    if target.is_default() or target.managed:
-                        continue
-                    overwrites.append({
-                        "target_type": "role",
-                        "target_id": str(target.id),
-                        "allow": overwrite.pair()[0].value,
-                        "deny": overwrite.pair()[1].value
-                    })
-                elif isinstance(target, discord.Member):
-                    overwrites.append({
-                        "target_type": "user",
-                        "target_id": str(target.id),
-                        "allow": overwrite.pair()[0].value,
-                        "deny": overwrite.pair()[1].value
-                    })
-            categories_data.append({
-                "id": str(cat.id),
-                "name": cat.name,
-                "position": cat.position,
-                "overwrites": overwrites
-            })
-        backup_data["categories"] = categories_data
-
-        # 채널 저장
-        channels_data = []
-        for ch in guild.channels:
-            if isinstance(ch, discord.CategoryChannel):
-                continue
-            if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.VoiceChannel):
+            categories_data = []
+            for cat in guild.categories:
                 overwrites = []
-                for target, overwrite in ch.overwrites.items():
+                for target, overwrite in cat.overwrites.items():
                     if isinstance(target, discord.Role):
                         if target.is_default() or target.managed:
                             continue
@@ -366,162 +326,212 @@ def create_bot(token, bot_name, config_path, backup_path):
                             "allow": overwrite.pair()[0].value,
                             "deny": overwrite.pair()[1].value
                         })
-                channels_data.append({
-                    "id": str(ch.id),
-                    "name": ch.name,
-                    "type": str(ch.type),
-                    "position": ch.position,
-                    "parent_id": str(ch.category.id) if ch.category else None,
+                categories_data.append({
+                    "id": str(cat.id),
+                    "name": cat.name,
+                    "position": cat.position,
                     "overwrites": overwrites
                 })
-        backup_data["channels"] = channels_data
+            backup_data["categories"] = categories_data
 
-        with open(backup_path, "w", encoding="utf-8") as f:
-            json.dump(backup_data, f, indent=4, ensure_ascii=False)
+            channels_data = []
+            for ch in guild.channels:
+                if isinstance(ch, discord.CategoryChannel):
+                    continue
+                if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.VoiceChannel):
+                    overwrites = []
+                    for target, overwrite in ch.overwrites.items():
+                        if isinstance(target, discord.Role):
+                            if target.is_default() or target.managed:
+                                continue
+                            overwrites.append({
+                                "target_type": "role",
+                                "target_id": str(target.id),
+                                "allow": overwrite.pair()[0].value,
+                                "deny": overwrite.pair()[1].value
+                            })
+                        elif isinstance(target, discord.Member):
+                            overwrites.append({
+                                "target_type": "user",
+                                "target_id": str(target.id),
+                                "allow": overwrite.pair()[0].value,
+                                "deny": overwrite.pair()[1].value
+                            })
+                    channels_data.append({
+                        "id": str(ch.id),
+                        "name": ch.name,
+                        "type": str(ch.type),
+                        "position": ch.position,
+                        "parent_id": str(ch.category.id) if ch.category else None,
+                        "overwrites": overwrites
+                    })
+            backup_data["channels"] = channels_data
 
-        await ctx.send("✅ 서버 구조가 성공적으로 백업되었습니다.")
+            with open(backup_path, "w", encoding="utf-8") as f:
+                json.dump(backup_data, f, indent=4, ensure_ascii=False)
 
-    # ============================================================
-    # 📌 !복구 (레이트리밋 방지 포함)
-    # ============================================================
-    async def safe_delete(obj, delay=0.8):
-        while True:
-            try:
-                await obj.delete()
-                await asyncio.sleep(delay)
-                return True
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
-                    print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
-                    await asyncio.sleep(retry_after + 1)
-                else:
-                    print(f"[{bot_name}] ❌ 삭제 실패: {e}")
+            await ctx.send("✅ 서버 구조가 성공적으로 백업되었습니다.")
+
+        async def safe_delete(obj, delay=0.8):
+            while True:
+                try:
+                    await obj.delete()
+                    await asyncio.sleep(delay)
+                    return True
+                except discord.HTTPException as e:
+                    if e.status == 429:
+                        retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                        print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
+                        await asyncio.sleep(retry_after + 1)
+                    else:
+                        print(f"[{bot_name}] ❌ 삭제 실패: {e}")
+                        return False
+                except Exception as e:
+                    print(f"[{bot_name}] ❌ 예상치 못한 오류: {e}")
                     return False
-            except Exception as e:
-                print(f"[{bot_name}] ❌ 예상치 못한 오류: {e}")
-                return False
 
-    async def safe_create_role(guild, data, delay=1.0):
-        while True:
-            try:
-                role = await guild.create_role(
-                    name=data["name"],
-                    color=discord.Color(data["color"]),
-                    hoist=data["hoist"],
-                    mentionable=data["mentionable"],
-                    permissions=discord.Permissions(data["permissions"])
-                )
-                await role.edit(position=data["position"])
-                await asyncio.sleep(delay)
-                return role
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
-                    print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
-                    await asyncio.sleep(retry_after + 1)
-                else:
-                    print(f"[{bot_name}] ❌ 역할 생성 실패: {e}")
-                    return None
-
-    async def safe_create_channel(guild, data, category=None, delay=0.7):
-        while True:
-            try:
-                if data["type"] == "text":
-                    ch = await guild.create_text_channel(
+        async def safe_create_role(guild, data, delay=1.0):
+            while True:
+                try:
+                    role = await guild.create_role(
                         name=data["name"],
-                        position=data["position"],
-                        category=category
+                        color=discord.Color(data["color"]),
+                        hoist=data["hoist"],
+                        mentionable=data["mentionable"],
+                        permissions=discord.Permissions(data["permissions"])
                     )
-                elif data["type"] == "voice":
-                    ch = await guild.create_voice_channel(
-                        name=data["name"],
-                        position=data["position"],
-                        category=category
-                    )
-                else:
-                    return None
-                await asyncio.sleep(delay)
-                return ch
-            except discord.HTTPException as e:
-                if e.status == 429:
-                    retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
-                    print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
-                    await asyncio.sleep(retry_after + 1)
-                else:
-                    print(f"[{bot_name}] ❌ 채널 생성 실패: {e}")
-                    return None
+                    await role.edit(position=data["position"])
+                    await asyncio.sleep(delay)
+                    return role
+                except discord.HTTPException as e:
+                    if e.status == 429:
+                        retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                        print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
+                        await asyncio.sleep(retry_after + 1)
+                    else:
+                        print(f"[{bot_name}] ❌ 역할 생성 실패: {e}")
+                        return None
 
-    @bot.command(name="복구")
-    @commands.check(is_authorized)
-    async def restore_server(ctx):
-        guild = ctx.guild
-        author = ctx.author
+        async def safe_create_channel(guild, data, category=None, delay=0.7):
+            while True:
+                try:
+                    if data["type"] == "text":
+                        ch = await guild.create_text_channel(
+                            name=data["name"],
+                            position=data["position"],
+                            category=category
+                        )
+                    elif data["type"] == "voice":
+                        ch = await guild.create_voice_channel(
+                            name=data["name"],
+                            position=data["position"],
+                            category=category
+                        )
+                    else:
+                        return None
+                    await asyncio.sleep(delay)
+                    return ch
+                except discord.HTTPException as e:
+                    if e.status == 429:
+                        retry_after = e.retry_after if hasattr(e, 'retry_after') else 5
+                        print(f"[{bot_name}] ⚠️ 레이트리밋 발생! {retry_after}초 대기 후 재시도...")
+                        await asyncio.sleep(retry_after + 1)
+                    else:
+                        print(f"[{bot_name}] ❌ 채널 생성 실패: {e}")
+                        return None
 
-        # 봇 권한 확인
-        bot_member = guild.get_member(bot.user.id)
-        if not bot_member.guild_permissions.administrator:
-            await ctx.author.send("❌ 봇에 `관리자` 권한이 없습니다. 서버 설정에서 권한을 부여해주세요.")
-            return
+        @bot.command(name="복구")
+        @commands.check(is_authorized)
+        async def restore_server(ctx):
+            guild = ctx.guild
+            author = ctx.author
 
-        if not os.path.exists(backup_path):
-            await ctx.author.send("❌ 백업 파일이 없습니다. 먼저 `!저장`을 실행하세요.")
-            return
+            bot_member = guild.get_member(bot.user.id)
+            if not bot_member.guild_permissions.administrator:
+                await ctx.author.send("❌ 봇에 `관리자` 권한이 없습니다. 서버 설정에서 권한을 부여해주세요.")
+                return
 
-        with open(backup_path, "r", encoding="utf-8") as f:
-            backup_data = json.load(f)
+            if not os.path.exists(backup_path):
+                await ctx.author.send("❌ 백업 파일이 없습니다. 먼저 `!저장`을 실행하세요.")
+                return
 
-        if not backup_data:
-            await ctx.author.send("❌ 백업 데이터가 비어있습니다.")
-            return
+            with open(backup_path, "r", encoding="utf-8") as f:
+                backup_data = json.load(f)
 
-        await ctx.send("⚠️ **경고**: 서버의 모든 채널, 카테고리, 역할(관리됨 제외)이 삭제되고 백업된 상태로 복구됩니다.\n"
-                       "레이트리밋 방지를 위해 **약 2~5분** 정도 소요될 수 있습니다.\n"
-                       "계속하려면 `yes`를 입력하세요. (30초 내)")
+            if not backup_data:
+                await ctx.author.send("❌ 백업 데이터가 비어있습니다.")
+                return
 
-        def check(m):
-            return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == "yes"
+            await ctx.send("⚠️ **경고**: 서버의 모든 채널, 카테고리, 역할(관리됨 제외)이 삭제되고 백업된 상태로 복구됩니다.\n"
+                           "레이트리밋 방지를 위해 **약 2~5분** 정도 소요될 수 있습니다.\n"
+                           "계속하려면 `yes`를 입력하세요. (30초 내)")
 
-        try:
-            await bot.wait_for("message", check=check, timeout=30.0)
-        except asyncio.TimeoutError:
-            await ctx.send("복구가 취소되었습니다.")
-            return
+            def check(m):
+                return m.author == ctx.author and m.channel == ctx.channel and m.content.lower() == "yes"
 
-        # 1. 모든 채널 삭제
-        await ctx.author.send("🔄 기존 채널 삭제 중... (약 1분 소요)")
-        for ch in guild.channels:
-            await safe_delete(ch, delay=0.6)
-
-        # 2. 모든 역할 삭제
-        await ctx.author.send("🔄 기존 역할 삭제 중... (약 1분 소요)")
-        for role in guild.roles:
-            if role.is_default() or role.managed:
-                continue
-            await safe_delete(role, delay=1.0)
-
-        # 3. 역할 재생성
-        await ctx.author.send("🔄 역할 재생성 중... (약 1~2분 소요)")
-        role_map = {}
-        roles_data = sorted(backup_data.get("roles", []), key=lambda r: r["position"])
-        for rdata in roles_data:
-            new_role = await safe_create_role(guild, rdata, delay=1.2)
-            if new_role:
-                role_map[rdata["id"]] = new_role
-
-        # 4. 카테고리 재생성
-        await ctx.author.send("🔄 카테고리 재생성 중...")
-        category_map = {}
-        for cdata in backup_data.get("categories", []):
             try:
-                new_cat = await guild.create_category(
-                    name=cdata["name"],
-                    position=cdata["position"]
-                )
-                await asyncio.sleep(0.7)
-                category_map[cdata["id"]] = new_cat
+                await bot.wait_for("message", check=check, timeout=30.0)
+            except asyncio.TimeoutError:
+                await ctx.send("복구가 취소되었습니다.")
+                return
 
-                for ow in cdata["overwrites"]:
+            await ctx.author.send("🔄 기존 채널 삭제 중... (약 1분 소요)")
+            for ch in guild.channels:
+                await safe_delete(ch, delay=0.6)
+
+            await ctx.author.send("🔄 기존 역할 삭제 중... (약 1분 소요)")
+            for role in guild.roles:
+                if role.is_default() or role.managed:
+                    continue
+                await safe_delete(role, delay=1.0)
+
+            await ctx.author.send("🔄 역할 재생성 중... (약 1~2분 소요)")
+            role_map = {}
+            roles_data = sorted(backup_data.get("roles", []), key=lambda r: r["position"])
+            for rdata in roles_data:
+                new_role = await safe_create_role(guild, rdata, delay=1.2)
+                if new_role:
+                    role_map[rdata["id"]] = new_role
+
+            await ctx.author.send("🔄 카테고리 재생성 중...")
+            category_map = {}
+            for cdata in backup_data.get("categories", []):
+                try:
+                    new_cat = await guild.create_category(
+                        name=cdata["name"],
+                        position=cdata["position"]
+                    )
+                    await asyncio.sleep(0.7)
+                    category_map[cdata["id"]] = new_cat
+
+                    for ow in cdata["overwrites"]:
+                        target = None
+                        if ow["target_type"] == "role":
+                            target = role_map.get(ow["target_id"])
+                        elif ow["target_type"] == "user":
+                            target = guild.get_member(int(ow["target_id"]))
+                        if target:
+                            allow = discord.Permissions(ow["allow"])
+                            deny = discord.Permissions(ow["deny"])
+                            try:
+                                await new_cat.set_permissions(
+                                    target,
+                                    overwrite=discord.PermissionOverwrite.from_pair(allow, deny)
+                                )
+                                await asyncio.sleep(0.5)
+                            except:
+                                pass
+                except Exception as e:
+                    print(f"[{bot_name}] 카테고리 생성 오류: {e}")
+
+            await ctx.author.send("🔄 채널 재생성 중... (약 2~3분 소요)")
+            for chdata in backup_data.get("channels", []):
+                parent = category_map.get(chdata["parent_id"]) if chdata["parent_id"] else None
+                new_ch = await safe_create_channel(guild, chdata, parent, delay=0.7)
+                if not new_ch:
+                    continue
+
+                for ow in chdata["overwrites"]:
                     target = None
                     if ow["target_type"] == "role":
                         target = role_map.get(ow["target_id"])
@@ -531,53 +541,26 @@ def create_bot(token, bot_name, config_path, backup_path):
                         allow = discord.Permissions(ow["allow"])
                         deny = discord.Permissions(ow["deny"])
                         try:
-                            await new_cat.set_permissions(
+                            await new_ch.set_permissions(
                                 target,
                                 overwrite=discord.PermissionOverwrite.from_pair(allow, deny)
                             )
                             await asyncio.sleep(0.5)
                         except:
                             pass
-            except Exception as e:
-                print(f"[{bot_name}] 카테고리 생성 오류: {e}")
 
-        # 5. 채널 재생성
-        await ctx.author.send("🔄 채널 재생성 중... (약 2~3분 소요)")
-        for chdata in backup_data.get("channels", []):
-            parent = category_map.get(chdata["parent_id"]) if chdata["parent_id"] else None
-            new_ch = await safe_create_channel(guild, chdata, parent, delay=0.7)
-            if not new_ch:
-                continue
-
-            for ow in chdata["overwrites"]:
-                target = None
-                if ow["target_type"] == "role":
-                    target = role_map.get(ow["target_id"])
-                elif ow["target_type"] == "user":
-                    target = guild.get_member(int(ow["target_id"]))
-                if target:
-                    allow = discord.Permissions(ow["allow"])
-                    deny = discord.Permissions(ow["deny"])
-                    try:
-                        await new_ch.set_permissions(
-                            target,
-                            overwrite=discord.PermissionOverwrite.from_pair(allow, deny)
-                        )
-                        await asyncio.sleep(0.5)
-                    except:
-                        pass
-
-        try:
-            await ctx.author.send("✅ 서버 복구가 완료되었습니다! (레이트리밋을 피하며 안전하게 처리됨)")
-        except discord.Forbidden:
-            print(f"[{bot_name}] 복구 완료되었으나 DM 전송 실패.")
+            try:
+                await ctx.author.send("✅ 서버 복구가 완료되었습니다! (레이트리밋을 피하며 안전하게 처리됨)")
+            except discord.Forbidden:
+                print(f"[{bot_name}] 복구 완료되었으나 DM 전송 실패.")
 
     # ============================================================
-    # 디스코드 뷰 (콘솔 버튼)
+    # 디스코드 뷰 (콘솔 버튼) - 봇 이름 전달
     # ============================================================
     class ConsoleView(discord.ui.View):
-        def __init__(self):
+        def __init__(self, bot_name):
             super().__init__(timeout=None)
+            self.bot_name = bot_name
 
         @discord.ui.button(label="인증하기", style=discord.ButtonStyle.green, emoji="✅", custom_id=CONSOLE_BUTTON_ID)
         async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -615,7 +598,7 @@ def create_bot(token, bot_name, config_path, backup_path):
             description="아래 버튼을 누르면 인증 링크를 받을 수 있습니다.",
             color=discord.Color.blurple()
         )
-        await ctx.send(embed=embed, view=ConsoleView())
+        await ctx.send(embed=embed, view=ConsoleView(bot_name))  # ✅ 봇 이름 전달
 
     # ============================================================
     # 봇 이벤트
@@ -623,7 +606,7 @@ def create_bot(token, bot_name, config_path, backup_path):
     @bot.event
     async def on_ready():
         if not hasattr(bot, "console_view_added"):
-            bot.add_view(ConsoleView())
+            bot.add_view(ConsoleView(bot_name))
             bot.console_view_added = True
 
         print(f"✅ [{bot_name}] {bot.user} 로 로그인 완료!")
@@ -631,11 +614,10 @@ def create_bot(token, bot_name, config_path, backup_path):
     return bot
 
 # ============================================================
-# Flask 웹서버 (reCAPTCHA + 루트 경로) - 두 봇이 공유
+# Flask 웹서버 (reCAPTCHA + 루트 경로)
 # ============================================================
 app = Flask(__name__)
 
-# 전역 pending_verifications (두 봇이 공유)
 pending_verifications_global = {}
 
 @app.route('/')
@@ -731,32 +713,26 @@ def verify_page():
                 success=None
             )
 
-        # 실제 클라이언트 IP 추출
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
 
-        # pending 데이터에서 guild_id와 user_id 추출
         data = pending_verifications_global.get(token)
         if not data:
             return "❌ 인증 정보가 없습니다.", 400
 
-        guild_id = data["guild_id"]
-        user_id = data["user_id"]
-
-        # 해당 guild_id를 관리하는 봇 찾기
+        bot_name = data.get("bot_name")
         target_bot = None
         for b in bots:
-            if b.get_guild(guild_id):
+            if b.bot_name == bot_name:
                 target_bot = b
                 break
 
         if not target_bot:
             return "❌ 해당 서버를 관리하는 봇을 찾을 수 없습니다.", 400
 
-        # 봇의 config_path를 사용하여 역할 부여
         future = asyncio.run_coroutine_threadsafe(
-            assign_role_from_web_wrapper(token, ip, guild_id, user_id, target_bot),
+            assign_role_from_web_wrapper(token, ip, data["guild_id"], data["user_id"], target_bot),
             target_bot.loop
         )
         try:
@@ -782,7 +758,7 @@ def verify_page():
             )
 
 # ============================================================
-# 웹 인증 처리 래퍼 (봇 인스턴스 사용)
+# 웹 인증 처리 래퍼
 # ============================================================
 async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int, user_id: int, bot_instance):
     try:
@@ -802,7 +778,6 @@ async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int, user_
         if not member:
             return False, "서버에서 해당 사용자를 찾을 수 없습니다."
 
-        # 해당 봇의 설정 파일 읽기
         config_path = bot_instance.config_path
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -853,7 +828,7 @@ async def assign_role_from_web_wrapper(token: str, ip: str, guild_id: int, user_
         return False, f"오류 발생: {str(e)}"
 
 # ============================================================
-# Flask 서버 실행 함수
+# Flask 서버 실행
 # ============================================================
 def run_flask():
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
@@ -866,19 +841,17 @@ bots = []
 async def main():
     global bots
 
-    # 봇1 생성 (기존 인증 + 저장/복구 기능)
-    bot1 = create_bot(TOKEN1, "봇1", CONFIG_PATH1, BACKUP_PATH1)
-    # 봇2 생성 (동일한 기능, 다른 토큰/설정파일)
-    bot2 = create_bot(TOKEN2, "봇2", CONFIG_PATH2, BACKUP_PATH2)
+    # 복구봇 (백업 기능 포함)
+    bot1 = create_bot(TOKEN1, "복구봇", CONFIG_PATH1, BACKUP_PATH1, include_backup=True)
+    # 인증봇 (백업 기능 제외, 오직 인증만)
+    bot2 = create_bot(TOKEN2, "인증봇", CONFIG_PATH2, BACKUP_PATH2, include_backup=False)
 
     bots = [bot1, bot2]
 
-    # Flask 서버 스레드 실행 (한 번만)
     thread = threading.Thread(target=run_flask, daemon=True)
     thread.start()
     print("🌐 웹서버가 http://0.0.0.0:5000 에서 실행 중입니다.")
 
-    # 두 봇 동시 실행
     await asyncio.gather(
         bot1.start(TOKEN1),
         bot2.start(TOKEN2)
