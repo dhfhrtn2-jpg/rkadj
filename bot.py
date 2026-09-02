@@ -1,5 +1,5 @@
 import discord
-from discord.ext import commands, tasks  # ✅ tasks 추가
+from discord.ext import commands, tasks
 import json
 import os
 import random
@@ -10,7 +10,7 @@ import threading
 import asyncio
 import requests
 import re
-import aiohttp  # ✅ aiohttp 추가
+import aiohttp
 from datetime import datetime, timezone, timedelta
 
 from flask import Flask, request, render_template_string
@@ -26,6 +26,7 @@ CONFIG_PATH2 = "config_bot2.json"
 BACKUP_PATH1 = "backup_bot1.json"
 BACKUP_PATH2 = "backup_bot2.json"
 CAPTCHA_EXPIRE_SECONDS = 600
+CONSOLE_BUTTON_ID = "verify_console_open_button"  # ✅ 추가됨
 KST = timezone(timedelta(hours=9))
 
 RECAPTCHA_SITE_KEY = os.getenv("RECAPTCHA_SITE_KEY")
@@ -106,7 +107,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             await ctx.send(f"❌ 오류가 발생했습니다: {str(error)}")
 
     # ============================================================
-    # 명령어들 (유저등록, 인증역할, 로그채널, 인증채널, 예외채널, 콘솔생성)
+    # 명령어들
     # ============================================================
     @bot.command(name="유저등록")
     @commands.check(is_bot_owner)
@@ -599,11 +600,10 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
         await ctx.send(embed=embed, view=view)
 
     # ============================================================
-    # ✅ 셀프 핑 (Keep-Alive) 루프 - 10분마다 자기 사이트 방문
+    # ✅ 셀프 핑 (Keep-Alive) 루프
     # ============================================================
     @tasks.loop(minutes=10)
     async def keep_alive():
-        """10분마다 자신의 사이트를 방문하여 Render 절전 모드 방지"""
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(BASE_URL, timeout=10) as resp:
@@ -616,13 +616,11 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     # ============================================================
     @bot.event
     async def on_ready():
-        # persistent view 등록
         if not hasattr(bot, "console_view_added"):
             view = ConsoleView(bot.custom_console_button_id)
             bot.add_view(view)
             bot.console_view_added = True
 
-        # ✅ 셀프 핑 루프 시작 (중복 방지)
         if not hasattr(bot, "keep_alive_started"):
             keep_alive.start()
             bot.keep_alive_started = True
@@ -633,7 +631,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     return bot
 
 # ============================================================
-# Flask 웹서버 (reCAPTCHA + 루트 경로)
+# Flask 웹서버
 # ============================================================
 app = Flask(__name__)
 pending_verifications_global = {}
@@ -859,7 +857,6 @@ bots = []
 async def main():
     global bots
 
-    # 복구봇: 접두사 !
     bot1 = create_bot(
         token=TOKEN1,
         bot_name="복구봇",
@@ -869,7 +866,6 @@ async def main():
         include_backup=True
     )
 
-    # 인증봇: 접두사 ?
     bot2 = create_bot(
         token=TOKEN2,
         bot_name="인증봇",
