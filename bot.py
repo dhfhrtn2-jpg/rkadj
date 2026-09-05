@@ -62,24 +62,6 @@ oauth_states = {}
 verified_users = {}
 
 # ============================================================
-# 스포일러 처리 (이모지만)
-# ============================================================
-def spoiler_emoji(text):
-    """텍스트를 스포일러로 감싸기 (||ㅇ||)"""
-    if not text:
-        return "||ㅇ||"
-    # 텍스트 전체를 스포일러로 감싸지 않고, 간단한 표시만
-    return text  # 전체 공개
-
-def spoiler_email(email):
-    """이메일은 전체 공개"""
-    return email if email else "없음"
-
-def spoiler_ip(ip):
-    """IP는 전체 공개"""
-    return ip if ip else "알 수 없음"
-
-# ============================================================
 # OAuth2 헬퍼 함수
 # ============================================================
 def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
@@ -128,15 +110,15 @@ def get_user_guilds(access_token):
     return response.json()
 
 def add_user_to_guild(bot_token, guild_id, user_id):
-    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (본문 없이)"""
+    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (빈 JSON 본문)"""
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}",
         "Content-Type": "application/json"
     }
     try:
-        # 본문 없이 PUT 요청 (봇 토큰 방식)
-        response = requests.put(url, headers=headers)
+        # 빈 JSON 문자열을 본문으로 전송
+        response = requests.put(url, headers=headers, data='{}')
         if response.status_code == 201:
             return True, "새로 추가됨"
         elif response.status_code == 204:
@@ -410,7 +392,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                # 봇 토큰으로 강제 초대 (본문 없이)
+                # 봇 토큰으로 강제 초대 (빈 JSON 본문)
                 success, msg = add_user_to_guild(token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
@@ -957,7 +939,7 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼 (스포일러: 이모지만, IP/이메일 전체 공개)
+# 웹 인증 처리 래퍼 (전체 공개)
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token):
     try:
@@ -996,7 +978,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if user_id not in verified_users[guild_key]:
             verified_users[guild_key].append(user_id)
 
-        # 사용자 서버 목록 (전체)
+        # 사용자 서버 목록
         user_guilds = []
         guilds_file = None
         if access_token:
