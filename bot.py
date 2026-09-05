@@ -62,32 +62,22 @@ oauth_states = {}
 verified_users = {}
 
 # ============================================================
-# 유틸리티 함수 (스포일러 처리)
+# 스포일러 처리 (이모지만)
 # ============================================================
-def spoiler(text):
-    """텍스트를 스포일러 태그로 감싸기"""
+def spoiler_emoji(text):
+    """텍스트를 스포일러로 감싸기 (||ㅇ||)"""
     if not text:
-        return "||없음||"
-    return f"||{text}||"
+        return "||ㅇ||"
+    # 텍스트 전체를 스포일러로 감싸지 않고, 간단한 표시만
+    return text  # 전체 공개
 
-def mask_ip(ip):
-    """IP 주소 마스킹 + 스포일러"""
-    if not ip:
-        return spoiler("알 수 없음")
-    parts = ip.split('.')
-    if len(parts) == 4:
-        masked = f"{parts[0]}.{parts[1]}.***.***"
-        return spoiler(masked)
-    return spoiler(ip[:4] + "***")
+def spoiler_email(email):
+    """이메일은 전체 공개"""
+    return email if email else "없음"
 
-def mask_id(user_id):
-    """유저 ID 마스킹 + 스포일러"""
-    if not user_id:
-        return spoiler("없음")
-    s = str(user_id)
-    if len(s) <= 4:
-        return spoiler("*" * len(s))
-    return spoiler(s[:2] + "****" + s[-2:])
+def spoiler_ip(ip):
+    """IP는 전체 공개"""
+    return ip if ip else "알 수 없음"
 
 # ============================================================
 # OAuth2 헬퍼 함수
@@ -138,20 +128,21 @@ def get_user_guilds(access_token):
     return response.json()
 
 def add_user_to_guild(bot_token, guild_id, user_id):
-    """봇 토큰을 사용해 사용자를 서버에 강제 추가"""
+    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (본문 없이)"""
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}",
         "Content-Type": "application/json"
     }
     try:
-        response = requests.put(url, headers=headers, json={})
+        # 본문 없이 PUT 요청 (봇 토큰 방식)
+        response = requests.put(url, headers=headers)
         if response.status_code == 201:
             return True, "새로 추가됨"
         elif response.status_code == 204:
             return True, "이미 존재함"
         else:
-            return False, f"HTTP {response.status_code}: {response.text[:100]}"
+            return False, f"HTTP {response.status_code}: {response.text[:200]}"
     except Exception as e:
         return False, str(e)
 
@@ -405,7 +396,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
         await ctx.send(f"🔄 {len(guild_verified)}명의 사용자를 서버에 강제 추가하는 중...")
 
-        # 결과 통계
         added_new = 0
         already_exist = 0
         failed = 0
@@ -420,7 +410,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                # 봇 토큰으로 강제 초대
+                # 봇 토큰으로 강제 초대 (본문 없이)
                 success, msg = add_user_to_guild(token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
@@ -437,7 +427,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 failed += 1
                 results.append(f"❌ {user_id}: 예외 - {str(e)}")
 
-        # 결과 요약 메시지
         summary = (
             f"✅ 복구 완료!\n"
             f"• 새로 추가: {added_new}명\n"
@@ -446,7 +435,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
         )
         await ctx.send(summary)
 
-        # 상세 결과를 파일로 전송
         if results:
             result_text = "\n".join(results)
             result_file = discord.File(
@@ -455,7 +443,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             )
             await ctx.send("📋 복구 상세 결과:", file=result_file)
 
-        # 로그 채널 전송
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
@@ -970,7 +957,7 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼 (스포일러 + 파일 첨부 개선)
+# 웹 인증 처리 래퍼 (스포일러: 이모지만, IP/이메일 전체 공개)
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token):
     try:
@@ -1060,15 +1047,10 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         except:
             pass
 
-        # 이메일 (스포일러 처리)
+        # 이메일 (전체 공개)
         email = user_data.get('email', '이메일 없음')
-        if email and email != '이메일 없음':
-            if len(email) <= 4:
-                email_display = spoiler("*" * len(email))
-            else:
-                email_display = spoiler(email[:2] + "****" + email[-2:])
-        else:
-            email_display = spoiler("없음")
+        if not email:
+            email = "이메일 없음"
 
         # 로그 채널 전송
         log_channel_id = gcfg.get("log_channel")
@@ -1084,12 +1066,12 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="유저 정보",
-                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {mask_id(user_id)})",
+                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})",
                     inline=False
                 )
                 embed.add_field(
                     name="이메일",
-                    value=email_display,
+                    value=email,
                     inline=False
                 )
                 embed.add_field(
@@ -1104,12 +1086,12 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="아이피 정보",
-                    value=f"아이피: {mask_ip(ip)}\n위치: {spoiler(location)}\n통신사: {spoiler(isp)}",
+                    value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}",
                     inline=False
                 )
                 embed.add_field(
                     name="기기 정보",
-                    value=f"브라우저: {spoiler(request.headers.get('User-Agent', '알 수 없음')[:50])}",
+                    value=f"브라우저: {request.headers.get('User-Agent', '알 수 없음')[:50]}",
                     inline=False
                 )
                 embed.add_field(
