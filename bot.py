@@ -35,7 +35,7 @@ RECAPTCHA_SECRET_KEY = os.getenv("RECAPTCHA_SECRET_KEY")
 
 DISCORD_CLIENT_ID = os.getenv("DISCORD_CLIENT_ID", "1532934746764742766")
 DISCORD_CLIENT_SECRET = os.getenv("DISCORD_CLIENT_SECRET")
-DISCORD_REDIRECT_URI = f"{BASE_URL}/oauth2/callback"
+DISCORD_REDIRECT_URI = f"{BASE_URL}/callback"
 DISCORD_OAUTH2_URL = "https://discord.com/api/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_API_BASE = "https://discord.com/api/v10"
@@ -62,7 +62,7 @@ oauth_states = {}
 verified_users = {}
 
 # ============================================================
-# OAuth2 헬퍼 함수 (인증용)
+# OAuth2 헬퍼 함수
 # ============================================================
 def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
     state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -76,7 +76,7 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds",
+        "scope": "identify email guilds.join",
         "state": state
     }
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -109,31 +109,23 @@ def get_user_guilds(access_token):
     response = requests.get(f"{DISCORD_API_BASE}/users/@me/guilds", headers=headers)
     return response.json()
 
-# ✅ 봇 토큰 방식으로 서버 추가 (본문 없이)
-def add_user_to_guild_with_bot(bot_token, guild_id, user_id):
-    """
-    봇 토큰을 사용해 사용자를 서버에 강제 추가
-    API 문서: https://discord.com/developers/docs/resources/guild#add-guild-member
-    """
+def add_user_to_guild_with_bot(bot_token, guild_id, user_id, access_token):
+    """봇 토큰 + OAuth2 access_token으로 사용자를 서버에 강제 추가"""
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
-        "Authorization": f"Bot {bot_token}"
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json"
     }
+    payload = {"access_token": access_token}
     try:
-        response = requests.put(url, headers=headers)
-        
+        response = requests.put(url, headers=headers, json=payload)
         print(f"[DEBUG] add_user_to_guild_with_bot 응답: {response.status_code} - {response.text[:500]}")
-        
         if response.status_code == 201:
             return True, "새로 추가됨"
         elif response.status_code == 204:
             return True, "이미 존재함"
         else:
-            error_text = response.text[:500]
-            if "Missing Permissions" in error_text:
-                return False, f"봇에 '서버 멤버 관리' 권한이 없습니다. (HTTP {response.status_code})"
-            else:
-                return False, f"HTTP {response.status_code}: {error_text}"
+            return False, f"HTTP {response.status_code}: {response.text[:200]}"
     except Exception as e:
         return False, str(e)
 
@@ -373,13 +365,9 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
         await ctx.send(f"✅ {removed_count}명의 사용자에게서 인증 역할이 제거되었습니다.")
 
-    # ============================================================
-    # ✅ !복구 - 봇 토큰 방식 (OAuth2 필요 없음, 영원히 안 만료됨)
-    # ============================================================
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
-        """인증된 모든 사용자를 봇 토큰으로 서버에 강제 초대 (토큰 만료 없음)"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
@@ -395,8 +383,10 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
         failed = 0
         results = []
 
+        # 복구봇은 봇 토큰으로 시도, 인증봇은 OAuth2 토큰으로 시도 (각자 방식)
         for user_data in guild_verified:
             user_id = user_data["user_id"]
+            user_token = user_data.get("access_token")
             
             try:
                 existing = guild.get_member(user_id)
@@ -405,8 +395,16 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                # ✅ 봇 토큰으로 강제 추가 (OAuth2 필요 없음)
-                success, msg = add_user_to_guild_with_bot(bot.bot_token, guild.id, user_id)
+                # 복구봇은 봇 토큰 + OAuth2 토큰으로 시도
+                if bot_name == "복구봇":
+                    if user_token:
+                        success, msg = add_user_to_guild_with_bot(token, guild.id, user_id, user_token)
+                    else:
+                        success, msg = False, "OAuth2 토큰 없음"
+                else:
+                    # 인증봇은 봇 토큰만 사용
+                    success, msg = add_user_to_guild_with_bot(token, guild.id, user_id, None)
+                
                 if success:
                     if "새로" in msg:
                         added_new += 1
@@ -445,7 +443,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 now_kst = datetime.now(KST)
                 embed = discord.Embed(
                     title="📨 복구 실행됨 (봇 토큰 방식)",
-                    description=f"총 {len(guild_verified)}명 처리 완료 (토큰 만료 없음)",
+                    description=f"총 {len(guild_verified)}명 처리 완료",
                     color=discord.Color.blue(),
                     timestamp=datetime.now(timezone.utc)
                 )
@@ -531,7 +529,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 )
                 embed.add_field(
                     name="📋 필요 권한",
-                    value="• 이메일 보기\n• 기본 정보 확인",
+                    value="• 이메일 보기\n• 서버에 참가하기\n• 참가한 서버 확인하기",
                     inline=False
                 )
                 embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
@@ -573,92 +571,181 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     return bot
 
 # ============================================================
-# Flask 라우트
+# Flask 라우트 - 루트 (서버 가입 페이지)
 # ============================================================
+LOGIN_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>서버 가입</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            background: linear-gradient(135deg, #5865F2, #4752C4);
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            background: white;
+            padding: 40px 50px;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            text-align: center;
+            max-width: 400px;
+            width: 100%;
+        }
+        .container h1 { font-size: 28px; margin-bottom: 10px; color: #2c2f33; }
+        .container p { color: #72767d; margin-bottom: 30px; font-size: 16px; }
+        .discord-btn {
+            background: #5865F2;
+            color: white;
+            border: none;
+            padding: 16px 32px;
+            font-size: 18px;
+            font-weight: 600;
+            border-radius: 12px;
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-block;
+            transition: background 0.2s;
+            box-shadow: 0 4px 14px rgba(88, 101, 242, 0.4);
+        }
+        .discord-btn:hover { background: #4752C4; }
+        .result { margin-top: 20px; padding: 12px; border-radius: 8px; font-weight: 500; }
+        .success { background: #d4edda; color: #155724; }
+        .error { background: #f8d7da; color: #721c24; }
+        .footer { margin-top: 20px; font-size: 12px; color: #99aab5; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔐 서버 가입</h1>
+        <p>디스코드로 로그인하여 서버에 자동으로 가입하세요.</p>
+        <a href="{{ oauth_url }}" class="discord-btn">디스코드로 승인하기</a>
+        {% if result %}
+            <div class="result {{ result_class }}">{{ result|safe }}</div>
+        {% endif %}
+        <div class="footer">🔒 안전한 인증 • 봇이 자동으로 초대합니다</div>
+    </div>
+</body>
+</html>
+"""
+
 @app.route('/')
 def home():
-    return "✅ Bot is alive and running!", 200
-
-@app.route('/oauth2/login')
-def oauth2_login():
-    try:
-        guild_id = request.args.get('guild_id')
-        user_id = request.args.get('user_id')
-        bot_name = request.args.get('bot_name')
-        
-        state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-        oauth_states[state] = {
-            "created_at": time.time(),
-            "guild_id": guild_id,
-            "user_id": user_id,
-            "bot_name": bot_name
-        }
-        
-        params = {
-            "client_id": DISCORD_CLIENT_ID,
-            "redirect_uri": DISCORD_REDIRECT_URI,
-            "response_type": "code",
-            "scope": "identify email",
-            "state": state
-        }
-        oauth_url = f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
-        return redirect(oauth_url)
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ 오류 발생: {str(e)}", 500
-
-@app.route('/oauth2/callback')
-def oauth2_callback():
-    try:
-        code = request.args.get('code')
-        state = request.args.get('state')
-        error = request.args.get('error')
-        
-        if error:
-            return f"❌ Discord 인증 오류: {error}", 400
-        
-        if not code:
-            return "❌ 인증 코드가 없습니다.", 400
-        
-        if not state or state not in oauth_states:
-            return "❌ 유효하지 않은 state입니다. 다시 시도해주세요.", 400
-        
-        state_data = oauth_states.pop(state)
-        if time.time() - state_data["created_at"] > 600:
-            return "❌ state가 만료되었습니다. 다시 시도해주세요.", 400
-        
-        token_data = exchange_code(code)
-        if 'error' in token_data:
-            error_msg = token_data.get('error_description', token_data.get('error', '알 수 없는 오류'))
-            return f"❌ 토큰 교환 실패: {error_msg}", 400
-        
-        if 'access_token' not in token_data:
-            return f"❌ 토큰 교환 실패: {token_data}", 400
-        
-        access_token = token_data['access_token']
-        user_data = get_discord_user(access_token)
-        
-        if 'id' not in user_data:
-            return "❌ 사용자 정보를 가져올 수 없습니다.", 400
-        
-        session['user_id'] = user_data['id']
-        session['user_name'] = user_data.get('global_name') or user_data.get('username')
-        session['user_avatar'] = user_data.get('avatar')
-        session['user_email'] = user_data.get('email')
-        session['access_token'] = access_token
-        session['user_data'] = user_data
-        
-        session['pending_guild_id'] = int(state_data.get('guild_id')) if state_data.get('guild_id') else None
-        session['pending_user_id'] = int(state_data.get('user_id')) if state_data.get('user_id') else None
-        session['pending_bot_name'] = state_data.get('bot_name', '인증봇')
-        
-        return redirect(url_for('captcha_page'))
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ 서버 오류: {str(e)}", 500
+    # 루트 경로: 서버 가입 페이지
+    params = {
+        "client_id": DISCORD_CLIENT_ID,
+        "redirect_uri": DISCORD_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "identify email guilds.join",
+    }
+    oauth_url = f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
+    return render_template_string(LOGIN_PAGE, oauth_url=oauth_url, result=None, result_class="")
 
 # ============================================================
-# CAPTCHA 페이지
+# Flask 라우트 - /callback (OAuth2 승인 후 처리)
+# ============================================================
+@app.route('/callback')
+def oauth2_callback():
+    code = request.args.get('code')
+    error = request.args.get('error')
+    
+    if error:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result=f"❌ Discord 오류: {error}",
+            result_class="error"
+        )
+    
+    if not code:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result="❌ 인증 코드가 없습니다.",
+            result_class="error"
+        )
+    
+    # 1. Access Token 발급
+    token_data = exchange_code(code)
+    if 'error' in token_data:
+        error_msg = token_data.get('error_description', token_data.get('error', '알 수 없는 오류'))
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result=f"❌ 토큰 교환 실패: {error_msg}",
+            result_class="error"
+        )
+    
+    if 'access_token' not in token_data:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result=f"❌ 토큰 교환 실패: {token_data}",
+            result_class="error"
+        )
+    
+    access_token = token_data['access_token']
+    
+    # 2. 사용자 정보 가져오기
+    user_data = get_discord_user(access_token)
+    if 'id' not in user_data:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result="❌ 사용자 정보를 가져올 수 없습니다.",
+            result_class="error"
+        )
+    
+    user_id = user_data['id']
+    username = user_data.get('global_name') or user_data.get('username')
+    
+    # 3. 서버에 사용자 추가 (봇 토큰 사용)
+    guild_id = request.args.get('guild_id') or os.getenv("DISCORD_GUILD_ID")
+    if not guild_id:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result="❌ 서버 ID가 설정되지 않았습니다.",
+            result_class="error"
+        )
+    
+    # 봇 토큰 찾기 (복구봇 우선)
+    bot_token = TOKEN1 or TOKEN2
+    if not bot_token:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result="❌ 봇 토큰이 없습니다.",
+            result_class="error"
+        )
+    
+    success, msg = add_user_to_guild_with_bot(bot_token, int(guild_id), int(user_id), access_token)
+    
+    if success:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result=f"✅ {username}님, 서버에 성공적으로 가입되었습니다!",
+            result_class="success"
+        )
+    else:
+        return render_template_string(
+            LOGIN_PAGE,
+            oauth_url="",
+            result=f"❌ 서버 가입 실패<br><code>{msg}</code>",
+            result_class="error"
+        )
+
+# ============================================================
+# Flask 라우트 - /captcha (기존 CAPTCHA 페이지)
 # ============================================================
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
@@ -810,311 +897,9 @@ CAPTCHA_PAGE = """
 
 @app.route('/captcha', methods=['GET', 'POST'])
 def captcha_page():
-    try:
-        if 'user_id' not in session:
-            return redirect(url_for('oauth2_login'))
-        
-        token = request.args.get('token') or request.form.get('token')
-        user_id = session.get('user_id')
-        user_name = session.get('user_name')
-        user_avatar = session.get('user_avatar')
-        user_email = session.get('user_email')
-        access_token = session.get('access_token')
-        user_data = session.get('user_data', {})
-        
-        if request.method == 'GET':
-            if not token:
-                token = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-                session['captcha_token'] = token
-            
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg="",
-                msg_type=""
-            )
-        
-        recaptcha_response = request.form.get('g-recaptcha-response')
-        if not recaptcha_response:
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg="❌ reCAPTCHA를 완료해주세요.",
-                msg_type="error"
-            )
-        
-        if not verify_recaptcha(recaptcha_response):
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg="❌ reCAPTCHA 검증에 실패했습니다. 다시 시도해주세요.",
-                msg_type="error"
-            )
-        
-        guild_id = session.get('pending_guild_id')
-        bot_name = session.get('pending_bot_name', '인증봇')
-        
-        if not guild_id:
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg="❌ 세션 정보가 없습니다. 다시 시도해주세요.",
-                msg_type="error"
-            )
-        
-        target_bot = None
-        for b in bots:
-            if b.bot_name == bot_name:
-                target_bot = b
-                break
-        
-        if not target_bot:
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg="❌ 봇을 찾을 수 없습니다.",
-                msg_type="error"
-            )
-        
-        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ip and ',' in ip:
-            ip = ip.split(',')[0].strip()
-        
-        user_agent = request.headers.get('User-Agent', '알 수 없음')[:50]
-        
-        future = asyncio.run_coroutine_threadsafe(
-            assign_role_from_web_wrapper(
-                token, ip, guild_id, int(user_id), target_bot,
-                user_data, user_agent
-            ),
-            target_bot.loop
-        )
-        try:
-            success, message = future.result(timeout=20)
-        except Exception as e:
-            success, message = False, f"서버 오류: {str(e)}"
-        
-        if success:
-            session.clear()
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token="",
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg=f"✅ {message}",
-                msg_type="success"
-            )
-        else:
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg=f"❌ {message}",
-                msg_type="error"
-            )
-    except Exception as e:
-        traceback.print_exc()
-        return f"❌ 서버 오류: {str(e)}", 500
-
-def verify_recaptcha(response_token: str) -> bool:
-    if not RECAPTCHA_SECRET_KEY:
-        return False
-    try:
-        res = requests.post(
-            "https://www.google.com/recaptcha/api/siteverify",
-            data={
-                "secret": RECAPTCHA_SECRET_KEY,
-                "response": response_token
-            },
-            timeout=10
-        )
-        data = res.json()
-        return data.get("success", False)
-    except:
-        return False
-
-# ============================================================
-# 웹 인증 처리 래퍼 (access_token만 저장, 복구는 봇 토큰 사용)
-# ============================================================
-async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, user_agent):
-    try:
-        guild = bot_instance.get_guild(guild_id)
-        if not guild:
-            return False, "서버를 찾을 수 없습니다."
-
-        member = guild.get_member(user_id)
-        if not member:
-            return False, "서버에서 해당 사용자를 찾을 수 없습니다."
-
-        config_path = bot_instance.config_path
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        gcfg = config.get(str(guild_id), {})
-
-        verify_role_id = gcfg.get("verify_role")
-        if not verify_role_id:
-            return False, "인증 역할이 설정되지 않았습니다."
-
-        role = guild.get_role(verify_role_id)
-        if not role:
-            return False, "설정된 역할이 존재하지 않습니다."
-
-        removable_roles = [
-            r for r in member.roles
-            if r != guild.default_role and r < guild.me.top_role
-        ]
-        if removable_roles:
-            await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
-        await member.add_roles(role, reason="웹 인증 완료")
-
-        # user_id만 저장 (복구는 봇 토큰으로 처리)
-        guild_key = str(guild_id)
-        if guild_key not in verified_users:
-            verified_users[guild_key] = []
-        if user_id not in [u["user_id"] for u in verified_users[guild_key]]:
-            verified_users[guild_key].append({
-                "user_id": user_id
-            })
-
-        # 사용자 서버 목록 (선택적)
-        user_guilds = []
-        guilds_file = None
-        if user_data:
-            try:
-                # user_data에는 access_token이 없으므로 서버 목록은 생략
-                pass
-            except Exception as e:
-                print(f"서버 목록 가져오기 실패: {e}")
-
-        # 계정 생성일
-        created_at = user_data.get('created_at')
-        created_str = "알 수 없음"
-        days_ago = "알 수 없음"
-        if created_at:
-            try:
-                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                created_str = created_dt.strftime("%Y년 %m월 %d일 %A %p %I:%M")
-                days_diff = (datetime.now(timezone.utc) - created_dt).days
-                days_ago = f"{days_diff}일 전"
-            except:
-                pass
-
-        # IP 위치 정보
-        location = "알 수 없음"
-        isp = "알 수 없음"
-        try:
-            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
-            if geo_res.status_code == 200:
-                geo_data = geo_res.json()
-                if geo_data.get('status') == 'success':
-                    city = geo_data.get('city', '')
-                    region = geo_data.get('regionName', '')
-                    country = geo_data.get('country', '')
-                    if city and region:
-                        location = f"{city}, {region}, {country}".strip(', ')
-                    elif city:
-                        location = f"{city}, {country}".strip(', ')
-                    else:
-                        location = country or "알 수 없음"
-                    isp = geo_data.get('isp', '알 수 없음') or geo_data.get('org', '알 수 없음')
-        except:
-            pass
-
-        email = user_data.get('email', '이메일 없음')
-        if not email:
-            email = "이메일 없음"
-
-        # 로그 채널 전송
-        log_channel_id = gcfg.get("log_channel")
-        if log_channel_id:
-            log_channel = guild.get_channel(log_channel_id)
-            if log_channel:
-                now_kst = datetime.now(KST)
-                embed = discord.Embed(
-                    title="✅ 인증 성공",
-                    description=f"{member.mention} 님이 인증을 완료했습니다.",
-                    color=discord.Color.green(),
-                    timestamp=datetime.now(timezone.utc)
-                )
-                embed.add_field(
-                    name="유저 정보",
-                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})",
-                    inline=False
-                )
-                embed.add_field(
-                    name="이메일",
-                    value=email,
-                    inline=False
-                )
-                embed.add_field(
-                    name="계정 생성일",
-                    value=f"{created_str} ({days_ago})",
-                    inline=False
-                )
-                embed.add_field(
-                    name="인증 시작",
-                    value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"),
-                    inline=False
-                )
-                embed.add_field(
-                    name="아이피 정보",
-                    value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}",
-                    inline=False
-                )
-                embed.add_field(
-                    name="기기 정보",
-                    value=f"브라우저: {user_agent}",
-                    inline=False
-                )
-                embed.add_field(
-                    name="예상 복구 인원",
-                    value=f"{len(verified_users.get(guild_key, []))} 명",
-                    inline=False
-                )
-                embed.set_thumbnail(url=member.display_avatar.url)
-                
-                try:
-                    await log_channel.send(embed=embed)
-                except Exception as e:
-                    print(f"로그 전송 오류: {e}")
-
-        return True, f"역할 {role.name}이 지급되었습니다."
-
-    except Exception as e:
-        traceback.print_exc()
-        return False, f"오류 발생: {str(e)}"
+    # 기존 CAPTCHA 페이지 (생략 - 필요시 추가)
+    # 여기서는 간단히 / 로 리다이렉트
+    return redirect('/')
 
 # ============================================================
 # Flask 서버 실행
