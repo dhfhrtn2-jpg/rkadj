@@ -110,15 +110,18 @@ def get_user_guilds(access_token):
     return response.json()
 
 def add_user_to_guild(bot_token, guild_id, user_id):
-    """봇 토큰을 사용해 사용자를 서버에 강제 추가"""
+    """
+    봇 토큰을 사용해 사용자를 서버에 강제 추가 (본문 없이)
+    API 문서: https://discord.com/developers/docs/resources/guild#add-guild-member
+    """
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}"
     }
     try:
+        # 본문(body) 없이 PUT 요청 전송
         response = requests.put(url, headers=headers)
         
-        # 디버깅용 로그
         print(f"[DEBUG] add_user_to_guild 응답: {response.status_code} - {response.text[:500]}")
         
         if response.status_code == 201:
@@ -128,7 +131,7 @@ def add_user_to_guild(bot_token, guild_id, user_id):
         else:
             error_text = response.text[:500]
             if "access_token" in error_text and "BASE_TYPE_REQUIRED" in error_text:
-                return False, f"봇 토큰이 유효하지 않거나 권한이 부족합니다. (HTTP {response.status_code}) - {error_text}"
+                return False, f"봇 토큰이 유효하지 않거나 '서버 멤버 관리' 권한이 없습니다. (HTTP {response.status_code})"
             elif "Missing Permissions" in error_text:
                 return False, f"봇에 '서버 멤버 관리' 또는 '관리자' 권한이 없습니다. (HTTP {response.status_code})"
             else:
