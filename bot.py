@@ -110,14 +110,14 @@ def get_user_guilds(access_token):
     return response.json()
 
 def add_user_to_guild(bot_token, guild_id, user_id):
-    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (Content-Type 헤더 없이)"""
+    """봇 토큰을 사용해 사용자를 서버에 강제 추가"""
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
-    # ✅ Content-Type 헤더 제거!
     headers = {
         "Authorization": f"Bot {bot_token}"
     }
     try:
-        response = requests.put(url, headers=headers)
+        # ✅ 빈 바이트 본문으로 요청 (Content-Length: 0)
+        response = requests.put(url, headers=headers, data=b'')
         if response.status_code == 201:
             return True, "새로 추가됨"
         elif response.status_code == 204:
@@ -128,7 +128,7 @@ def add_user_to_guild(bot_token, guild_id, user_id):
         return False, str(e)
 
 # ============================================================
-# 봇 팩토리 함수
+# 봇 팩토리 함수 (이전과 동일 - 생략)
 # ============================================================
 def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup=True):
     intents = discord.Intents.default()
@@ -366,7 +366,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
-        """인증된 모든 사용자를 강제로 서버에 초대 - 상세 로그 포함"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
@@ -384,14 +383,12 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
         for user_id in guild_verified:
             try:
-                # 이미 서버에 있는지 확인
                 existing = guild.get_member(user_id)
                 if existing:
                     already_exist += 1
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                # 봇 토큰으로 강제 초대 (Content-Type 없이)
                 success, msg = add_user_to_guild(token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
