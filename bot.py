@@ -109,20 +109,24 @@ def get_user_guilds(access_token):
     response = requests.get(f"{DISCORD_API_BASE}/users/@me/guilds", headers=headers)
     return response.json()
 
-def add_user_to_guild(bot_token, guild_id, user_id):
+def add_user_to_guild_with_oauth(access_token, guild_id, user_id):
     """
-    봇 토큰을 사용해 사용자를 서버에 강제 추가 (본문 없이)
+    OAuth2 토큰을 사용해 사용자를 서버에 강제 추가
     API 문서: https://discord.com/developers/docs/resources/guild#add-guild-member
     """
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
-        "Authorization": f"Bot {bot_token}"
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+    # OAuth2 방식에서는 본문에 access_token을 포함해야 함
+    payload = {
+        "access_token": access_token
     }
     try:
-        # 본문(body) 없이 PUT 요청 전송
-        response = requests.put(url, headers=headers)
+        response = requests.put(url, headers=headers, json=payload)
         
-        print(f"[DEBUG] add_user_to_guild 응답: {response.status_code} - {response.text[:500]}")
+        print(f"[DEBUG] add_user_to_guild_with_oauth 응답: {response.status_code} - {response.text[:500]}")
         
         if response.status_code == 201:
             return True, "새로 추가됨"
@@ -130,9 +134,7 @@ def add_user_to_guild(bot_token, guild_id, user_id):
             return True, "이미 존재함"
         else:
             error_text = response.text[:500]
-            if "access_token" in error_text and "BASE_TYPE_REQUIRED" in error_text:
-                return False, f"봇 토큰이 유효하지 않거나 '서버 멤버 관리' 권한이 없습니다. (HTTP {response.status_code})"
-            elif "Missing Permissions" in error_text:
+            if "Missing Permissions" in error_text:
                 return False, f"봇에 '서버 멤버 관리' 또는 '관리자' 권한이 없습니다. (HTTP {response.status_code})"
             else:
                 return False, f"HTTP {response.status_code}: {error_text}"
@@ -378,6 +380,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
+        """인증된 모든 사용자를 OAuth2 토큰으로 서버에 강제 초대"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
@@ -393,7 +396,10 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
         failed = 0
         results = []
 
-        for user_id in guild_verified:
+        for user_data in guild_verified:
+            user_id = user_data["user_id"]
+            user_token = user_data.get("access_token")
+            
             try:
                 existing = guild.get_member(user_id)
                 if existing:
@@ -401,7 +407,13 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                success, msg = add_user_to_guild(token, guild.id, user_id)
+                if not user_token:
+                    failed += 1
+                    results.append(f"❌ {user_id}: OAuth2 토큰 없음 (재인증 필요)")
+                    continue
+                
+                # ✅ OAuth2 토큰으로 강제 추가
+                success, msg = add_user_to_guild_with_oauth(user_token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
                         added_new += 1
@@ -439,7 +451,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             if log_channel:
                 now_kst = datetime.now(KST)
                 embed = discord.Embed(
-                    title="📨 복구 실행됨 (강제 초대)",
+                    title="📨 복구 실행됨 (OAuth2 강제 초대)",
                     description=f"총 {len(guild_verified)}명 처리 완료",
                     color=discord.Color.blue(),
                     timestamp=datetime.now(timezone.utc)
@@ -961,7 +973,7 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼
+# 웹 인증 처리 래퍼 (access_token 저장)
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, user_agent):
     try:
@@ -994,11 +1006,15 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
         await member.add_roles(role, reason="웹 인증 완료")
 
+        # ✅ access_token을 함께 저장
         guild_key = str(guild_id)
         if guild_key not in verified_users:
             verified_users[guild_key] = []
-        if user_id not in verified_users[guild_key]:
-            verified_users[guild_key].append(user_id)
+        if not any(u["user_id"] == user_id for u in verified_users[guild_key]):
+            verified_users[guild_key].append({
+                "user_id": user_id,
+                "access_token": access_token
+            })
 
         # 사용자 서버 목록
         user_guilds = []
