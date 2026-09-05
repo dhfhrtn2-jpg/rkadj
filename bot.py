@@ -49,7 +49,6 @@ WEB_PORT = 5000
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "".join(random.choices(string.ascii_letters + string.digits, k=32)))
 
-# HTTPS 환경에서 세션 쿠키 설정
 app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
@@ -60,6 +59,26 @@ app.config.update(
 pending_verifications_global = {}
 oauth_states = {}
 verified_users = {}
+
+# ============================================================
+# 유틸리티 함수
+# ============================================================
+def mask_string(s, show=4):
+    """문자열을 스포이드 처리"""
+    if not s:
+        return "****"
+    if len(s) <= show:
+        return "*" * len(s)
+    return s[:show] + "*" * (len(s) - show * 2) + s[-show:] if len(s) > show * 2 else s[:show] + "*" * (len(s) - show)
+
+def mask_ip(ip):
+    """IP 주소 스포이드 처리 (예: 1.243.41.165 → 1.243.***.***)"""
+    if not ip:
+        return "알 수 없음"
+    parts = ip.split('.')
+    if len(parts) == 4:
+        return f"{parts[0]}.{parts[1]}.***.***"
+    return mask_string(ip, 2)
 
 # ============================================================
 # OAuth2 헬퍼 함수
@@ -109,6 +128,19 @@ def get_user_guilds(access_token):
     response = requests.get(f"{DISCORD_API_BASE}/users/@me/guilds", headers=headers)
     return response.json()
 
+def add_user_to_guild(bot_token, guild_id, user_id):
+    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (봇이 서버에 있어야 함)"""
+    url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.put(url, headers=headers, json={})
+        return response.status_code in [201, 204]
+    except:
+        return False
+
 # ============================================================
 # 봇 팩토리 함수
 # ============================================================
@@ -125,6 +157,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     bot.bot_name = bot_name
     bot.prefix = prefix
     bot.custom_console_button_id = f"verify_console_{bot_name}"
+    bot.bot_token = token  # 봇 토큰 저장
 
     def load_config():
         if os.path.exists(config_path):
@@ -347,6 +380,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
+        """인증된 모든 사용자를 강제로 서버에 초대 (guilds.join 권한 사용)"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
@@ -355,36 +389,27 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             await ctx.send("ℹ️ 인증된 사용자가 없습니다.")
             return
 
-        await ctx.send(f"🔄 {len(guild_verified)}명의 사용자를 서버로 초대하는 중...")
+        await ctx.send(f"🔄 {len(guild_verified)}명의 사용자를 서버에 강제 추가하는 중... (봇 토큰 사용)")
 
-        invited_count = 0
+        added_count = 0
         failed_count = 0
         
         for user_id in guild_verified:
             try:
-                user = await bot.fetch_user(user_id)
-                if not user:
+                # 이미 서버에 있는지 확인
+                existing = guild.get_member(user_id)
+                if existing:
+                    continue
+                
+                # 봇 토큰으로 강제 초대
+                success = add_user_to_guild(token, guild.id, user_id)
+                if success:
+                    added_count += 1
+                else:
                     failed_count += 1
-                    continue
-                
-                existing_member = guild.get_member(user_id)
-                if existing_member:
-                    continue
-                
-                invite_channel = guild.text_channels[0] if guild.text_channels else None
-                if invite_channel:
-                    try:
-                        invite = await invite_channel.create_invite(max_uses=1, max_age=86400, reason="복구 명령어 실행")
-                        await user.send(f"🔐 서버로 초대합니다! {invite.url}")
-                        invited_count += 1
-                    except discord.Forbidden:
-                        failed_count += 1
-                    except Exception as e:
-                        print(f"❌ {user_id} 초대 실패: {e}")
-                        failed_count += 1
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
             except Exception as e:
-                print(f"❌ {user_id} 처리 실패: {e}")
+                print(f"❌ {user_id} 강제 초대 실패: {e}")
                 failed_count += 1
 
         log_channel_id = gcfg.get("log_channel")
@@ -393,20 +418,20 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             if log_channel:
                 now_kst = datetime.now(KST)
                 embed = discord.Embed(
-                    title="📨 복구 실행됨 (초대)",
-                    description=f"{invited_count}명의 사용자에게 초대장이 전송되었습니다.",
+                    title="📨 복구 실행됨 (강제 초대)",
+                    description=f"{added_count}명의 사용자가 서버에 강제 추가되었습니다.",
                     color=discord.Color.blue(),
                     timestamp=datetime.now(timezone.utc)
                 )
                 embed.add_field(name="실행자", value=ctx.author.mention, inline=False)
-                embed.add_field(name="초대 성공", value=str(invited_count), inline=True)
-                embed.add_field(name="초대 실패", value=str(failed_count), inline=True)
+                embed.add_field(name="추가 성공", value=str(added_count), inline=True)
+                embed.add_field(name="추가 실패", value=str(failed_count), inline=True)
                 try:
                     await log_channel.send(embed=embed)
                 except:
                     pass
 
-        await ctx.send(f"✅ {invited_count}명의 사용자에게 초대장이 전송되었습니다. (실패: {failed_count}명)")
+        await ctx.send(f"✅ {added_count}명의 사용자가 서버에 강제 추가되었습니다. (실패: {failed_count}명)")
 
     async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
         role = guild.get_role(allowed_role_id)
@@ -902,7 +927,7 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼
+# 웹 인증 처리 래퍼 (개선됨)
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token):
     try:
@@ -941,14 +966,24 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if user_id not in verified_users[guild_key]:
             verified_users[guild_key].append(user_id)
 
+        # 사용자 서버 목록 (전체)
         user_guilds = []
+        guilds_file = None
         if access_token:
             try:
                 guilds_data = get_user_guilds(access_token)
                 user_guilds = [f"{g['name']} ({g['id']})" for g in guilds_data]
-            except:
-                pass
+                
+                # 전체 목록을 파일로 생성
+                guilds_text = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
+                guilds_file = discord.File(
+                    io.BytesIO(guilds_text.encode('utf-8')),
+                    filename=f"서버목록_{user_id}.txt"
+                )
+            except Exception as e:
+                print(f"서버 목록 가져오기 실패: {e}")
 
+        # 계정 생성일
         created_at = user_data.get('created_at')
         created_str = "알 수 없음"
         days_ago = "알 수 없음"
@@ -961,18 +996,32 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             except:
                 pass
 
+        # IP 위치 정보 (개선)
         location = "알 수 없음"
         isp = "알 수 없음"
         try:
-            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=country,city,isp,org", timeout=5)
+            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
             if geo_res.status_code == 200:
                 geo_data = geo_res.json()
                 if geo_data.get('status') == 'success':
-                    location = f"{geo_data.get('city', '')}, {geo_data.get('country', '')}".strip(', ')
+                    city = geo_data.get('city', '')
+                    region = geo_data.get('regionName', '')
+                    country = geo_data.get('country', '')
+                    if city and region:
+                        location = f"{city}, {region}, {country}".strip(', ')
+                    elif city:
+                        location = f"{city}, {country}".strip(', ')
+                    else:
+                        location = country or "알 수 없음"
                     isp = geo_data.get('isp', '알 수 없음') or geo_data.get('org', '알 수 없음')
         except:
             pass
 
+        # 이메일
+        email = user_data.get('email', '이메일 없음')
+        masked_email = mask_string(email, 2) if email and email != '이메일 없음' else email
+
+        # 로그 채널 전송
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
@@ -986,7 +1035,12 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="유저 정보",
-                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})",
+                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {mask_string(str(user_id), 4)})",
+                    inline=False
+                )
+                embed.add_field(
+                    name="이메일",
+                    value=f"`{masked_email}`",
                     inline=False
                 )
                 embed.add_field(
@@ -1001,7 +1055,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="아이피 정보",
-                    value=f"아이피: `{ip}`\n위치: {location}\n통신사: {isp}",
+                    value=f"아이피: `{mask_ip(ip)}`\n위치: {location}\n통신사: {isp}",
                     inline=False
                 )
                 embed.add_field(
@@ -1009,12 +1063,9 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                     value=f"브라우저: {request.headers.get('User-Agent', '알 수 없음')[:50]}",
                     inline=False
                 )
-                guild_list = "\n".join(user_guilds[:5]) if user_guilds else "없음"
-                if len(user_guilds) > 5:
-                    guild_list += f"\n... 외 {len(user_guilds)-5}개"
                 embed.add_field(
-                    name="참가 서버 목록",
-                    value=guild_list,
+                    name="참가 서버 수",
+                    value=f"{len(user_guilds)}개 (파일 참조)",
                     inline=False
                 )
                 embed.add_field(
@@ -1023,10 +1074,19 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                     inline=False
                 )
                 embed.set_thumbnail(url=member.display_avatar.url)
+                
+                # 파일 첨부 (서버 목록)
+                files = []
+                if guilds_file:
+                    files.append(guilds_file)
+                
                 try:
-                    await log_channel.send(embed=embed)
-                except:
-                    pass
+                    if files:
+                        await log_channel.send(embed=embed, files=files)
+                    else:
+                        await log_channel.send(embed=embed)
+                except Exception as e:
+                    print(f"로그 전송 오류: {e}")
 
         return True, f"역할 {role.name}이 지급되었습니다."
 
