@@ -110,14 +110,13 @@ def get_user_guilds(access_token):
     return response.json()
 
 def add_user_to_guild(bot_token, guild_id, user_id):
-    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (본문 없이)"""
+    """봇 토큰을 사용해 사용자를 서버에 강제 추가 (Content-Type 헤더 없이)"""
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
+    # ✅ Content-Type 헤더 제거!
     headers = {
-        "Authorization": f"Bot {bot_token}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bot {bot_token}"
     }
     try:
-        # ✅ 본문 없이 PUT 요청
         response = requests.put(url, headers=headers)
         if response.status_code == 201:
             return True, "새로 추가됨"
@@ -392,7 +391,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                # 봇 토큰으로 강제 초대 (본문 없이)
+                # 봇 토큰으로 강제 초대 (Content-Type 없이)
                 success, msg = add_user_to_guild(token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
@@ -939,7 +938,7 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼 (전체 공개)
+# 웹 인증 처리 래퍼
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token):
     try:
