@@ -11,11 +11,9 @@ import asyncio
 import requests
 import re
 import aiohttp
-import base64
-import hashlib
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
+from flask import Flask, request, render_template_string, redirect, session, url_for
 
 # ============================================================
 # 공통 설정 (환경변수)
@@ -51,6 +49,14 @@ WEB_PORT = 5000
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "".join(random.choices(string.ascii_letters + string.digits, k=32)))
 
+# HTTPS 환경에서 세션 쿠키 설정
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='Lax',
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=24)
+)
+
 pending_verifications_global = {}
 oauth_states = {}
 verified_users = {}
@@ -59,10 +65,13 @@ verified_users = {}
 # OAuth2 헬퍼 함수
 # ============================================================
 def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
-    """OAuth2 인증 URL 생성 (쿼리 파라미터 포함)"""
     state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-    oauth_states[state] = time.time()
-    
+    oauth_states[state] = {
+        "created_at": time.time(),
+        "guild_id": guild_id,
+        "user_id": user_id,
+        "bot_name": bot_name
+    }
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
@@ -70,18 +79,12 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "scope": "identify email guilds guilds.join",
         "state": state
     }
-    
-    # 추가 파라미터
-    if guild_id:
-        params["guild_id"] = guild_id
-    if user_id:
-        params["user_id"] = user_id
-    if bot_name:
-        params["bot_name"] = bot_name
-    
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
 
 def exchange_code(code):
+    if not DISCORD_CLIENT_SECRET:
+        return {"error": "missing_secret", "error_description": "DISCORD_CLIENT_SECRET 환경변수가 설정되지 않았습니다."}
+    
     data = {
         "client_id": DISCORD_CLIENT_ID,
         "client_secret": DISCORD_CLIENT_SECRET,
@@ -90,8 +93,11 @@ def exchange_code(code):
         "redirect_uri": DISCORD_REDIRECT_URI
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    response = requests.post(DISCORD_TOKEN_URL, data=data, headers=headers)
-    return response.json()
+    try:
+        response = requests.post(DISCORD_TOKEN_URL, data=data, headers=headers, timeout=10)
+        return response.json()
+    except Exception as e:
+        return {"error": "request_failed", "error_description": str(e)}
 
 def get_discord_user(access_token):
     headers = {"Authorization": f"Bearer {access_token}"}
@@ -442,7 +448,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                             pass
 
     # ============================================================
-    # ConsoleView - session 대신 URL 파라미터 사용
+    # ConsoleView
     # ============================================================
     class ConsoleView(discord.ui.View):
         def __init__(self, custom_id, bot_name):
@@ -462,7 +468,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                         ephemeral=True
                     )
 
-                # ✅ URL에 guild_id, user_id, bot_name을 쿼리 파라미터로 포함
                 oauth_url = generate_oauth2_url(
                     guild_id=interaction.guild_id,
                     user_id=interaction.user.id,
@@ -471,7 +476,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
                 embed = discord.Embed(
                     title="🔐 디스코드 인증",
-                    description=f"[디스코드로 로그인하여 인증을 완료하세요]({oauth_url})\n\n",
+                    description=f"[디스코드로 로그인하여 인증을 완료하세요]({oauth_url})",
                     color=discord.Color.blue()
                 )
                 embed.add_field(
@@ -489,6 +494,9 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 except:
                     pass
 
+    # ============================================================
+    # 셀프 핑 (Keep-Alive)
+    # ============================================================
     @tasks.loop(minutes=10)
     async def keep_alive():
         try:
@@ -515,32 +523,25 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     return bot
 
 # ============================================================
-# Flask 웹서버
+# Flask 라우트
 # ============================================================
 @app.route('/')
 def home():
     return "✅ Bot is alive and running!", 200
 
-# ============================================================
-# OAuth2 라우트
-# ============================================================
 @app.route('/oauth2/login')
 def oauth2_login():
-    """OAuth2 로그인 시작 - 쿼리 파라미터에서 정보를 읽어 세션에 저장"""
     guild_id = request.args.get('guild_id')
     user_id = request.args.get('user_id')
     bot_name = request.args.get('bot_name')
     
-    if guild_id:
-        session['pending_guild_id'] = int(guild_id)
-    if user_id:
-        session['pending_user_id'] = int(user_id)
-    if bot_name:
-        session['pending_bot_name'] = bot_name
-    
-    # OAuth2 URL 생성 (상태 포함)
     state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-    oauth_states[state] = time.time()
+    oauth_states[state] = {
+        "created_at": time.time(),
+        "guild_id": guild_id,
+        "user_id": user_id,
+        "bot_name": bot_name
+    }
     
     params = {
         "client_id": DISCORD_CLIENT_ID,
@@ -559,27 +560,47 @@ def oauth2_callback():
     error = request.args.get('error')
     
     if error:
-        return f"❌ 인증 오류: {error}", 400
+        return f"❌ Discord 인증 오류: {error}", 400
     
     if not code:
         return "❌ 인증 코드가 없습니다.", 400
     
+    if not state or state not in oauth_states:
+        return "❌ 유효하지 않은 state입니다. 다시 시도해주세요.", 400
+    
+    state_data = oauth_states.pop(state)
+    if time.time() - state_data["created_at"] > 600:
+        return "❌ state가 만료되었습니다. 다시 시도해주세요.", 400
+    
     token_data = exchange_code(code)
+    if 'error' in token_data:
+        error_msg = token_data.get('error_description', token_data.get('error', '알 수 없는 오류'))
+        return f"❌ 토큰 교환 실패: {error_msg}", 400
+    
     if 'access_token' not in token_data:
         return f"❌ 토큰 교환 실패: {token_data}", 400
     
     access_token = token_data['access_token']
     user_data = get_discord_user(access_token)
-    user_guilds = get_user_guilds(access_token)
     
+    if 'id' not in user_data:
+        return "❌ 사용자 정보를 가져올 수 없습니다.", 400
+    
+    session['user_id'] = user_data['id']
+    session['user_name'] = user_data.get('global_name') or user_data.get('username')
+    session['user_avatar'] = user_data.get('avatar')
+    session['user_email'] = user_data.get('email')
     session['access_token'] = access_token
     session['user_data'] = user_data
-    session['user_guilds'] = user_guilds
+    
+    session['pending_guild_id'] = int(state_data.get('guild_id')) if state_data.get('guild_id') else None
+    session['pending_user_id'] = int(state_data.get('user_id')) if state_data.get('user_id') else None
+    session['pending_bot_name'] = state_data.get('bot_name', '인증봇')
     
     return redirect(url_for('captcha_page'))
 
 # ============================================================
-# CAPTCHA 페이지 (모바일 최적화)
+# CAPTCHA 페이지
 # ============================================================
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
@@ -680,20 +701,20 @@ CAPTCHA_PAGE = """
             <p>로봇이 아님을 인증해주세요</p>
         </div>
 
-        {% if user %}
+        {% if user_name %}
         <div class="user-card">
             <div class="avatar">
-                {% if user.avatar %}
-                <img src="https://cdn.discordapp.com/avatars/{{ user.id }}/{{ user.avatar }}.png?size=64" alt="avatar">
+                {% if user_avatar %}
+                <img src="https://cdn.discordapp.com/avatars/{{ user_id }}/{{ user_avatar }}.png?size=64" alt="avatar">
                 {% else %}
                 <div style="width:48px;height:48px;border-radius:50%;background:#cbd5e0;display:flex;align-items:center;justify-content:center;font-size:20px;color:#718096;">
-                    {{ user.global_name|default(user.username)|first|upper }}
+                    {{ user_name|first|upper }}
                 </div>
                 {% endif %}
             </div>
             <div class="info">
-                <div class="name">{{ user.global_name|default(user.username) }}</div>
-                <div class="email">{{ user.email|default('이메일 없음') }}</div>
+                <div class="name">{{ user_name }}</div>
+                <div class="email">{{ user_email|default('이메일 없음') }}</div>
             </div>
         </div>
         {% endif %}
@@ -731,37 +752,44 @@ CAPTCHA_PAGE = """
 
 @app.route('/captcha', methods=['GET', 'POST'])
 def captcha_page():
-    token = request.args.get('token') or request.form.get('token')
-    user_data = session.get('user_data')
-    access_token = session.get('access_token')
-    
-    if not user_data:
+    if 'user_id' not in session:
         return redirect(url_for('oauth2_login'))
+    
+    token = request.args.get('token') or request.form.get('token')
+    user_id = session.get('user_id')
+    user_name = session.get('user_name')
+    user_avatar = session.get('user_avatar')
+    user_email = session.get('user_email')
+    access_token = session.get('access_token')
+    user_data = session.get('user_data', {})
     
     if request.method == 'GET':
         if not token:
             token = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-            session['captcha_token'] = token
-        else:
             session['captcha_token'] = token
         
         return render_template_string(
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token=token,
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg="",
             msg_type=""
         )
     
-    # POST
     recaptcha_response = request.form.get('g-recaptcha-response')
     if not recaptcha_response:
         return render_template_string(
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token=token,
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg="❌ reCAPTCHA를 완료해주세요.",
             msg_type="error"
         )
@@ -771,12 +799,14 @@ def captcha_page():
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token=token,
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg="❌ reCAPTCHA 검증에 실패했습니다. 다시 시도해주세요.",
             msg_type="error"
         )
     
-    user_id = int(user_data['id'])
     guild_id = session.get('pending_guild_id')
     bot_name = session.get('pending_bot_name', '인증봇')
     
@@ -785,7 +815,10 @@ def captcha_page():
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token=token,
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg="❌ 세션 정보가 없습니다. 다시 시도해주세요.",
             msg_type="error"
         )
@@ -801,7 +834,10 @@ def captcha_page():
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token=token,
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg="❌ 봇을 찾을 수 없습니다.",
             msg_type="error"
         )
@@ -812,7 +848,7 @@ def captcha_page():
     
     future = asyncio.run_coroutine_threadsafe(
         assign_role_from_web_wrapper(
-            token, ip, guild_id, user_id, target_bot,
+            token, ip, guild_id, int(user_id), target_bot,
             user_data, access_token
         ),
         target_bot.loop
@@ -828,7 +864,10 @@ def captcha_page():
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token="",
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg=f"✅ {message}",
             msg_type="success"
         )
@@ -837,7 +876,10 @@ def captcha_page():
             CAPTCHA_PAGE,
             site_key=RECAPTCHA_SITE_KEY or "",
             token=token,
-            user=user_data,
+            user_id=user_id,
+            user_name=user_name,
+            user_avatar=user_avatar,
+            user_email=user_email,
             msg=f"❌ {message}",
             msg_type="error"
         )
