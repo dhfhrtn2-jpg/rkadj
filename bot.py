@@ -39,7 +39,6 @@ DISCORD_REDIRECT_URI = f"{BASE_URL}/oauth2/callback"
 DISCORD_OAUTH2_URL = "https://discord.com/api/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_API_BASE = "https://discord.com/api/v10"
-DISCORD_REVOKE_URL = "https://discord.com/api/oauth2/token/revoke"
 
 ALLOWED_USER_IDS = [
     1379356844920799255,
@@ -63,7 +62,7 @@ oauth_states = {}
 verified_users = {}
 
 # ============================================================
-# OAuth2 헬퍼 함수
+# OAuth2 헬퍼 함수 (인증용)
 # ============================================================
 def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
     state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
@@ -77,7 +76,7 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds guilds.join",
+        "scope": "identify email guilds",
         "state": state
     }
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -100,29 +99,6 @@ def exchange_code(code):
     except Exception as e:
         return {"error": "request_failed", "error_description": str(e)}
 
-def refresh_access_token(refresh_token):
-    """Refresh Token으로 새 Access Token 발급"""
-    if not DISCORD_CLIENT_SECRET or not refresh_token:
-        return None
-    
-    data = {
-        "client_id": DISCORD_CLIENT_ID,
-        "client_secret": DISCORD_CLIENT_SECRET,
-        "grant_type": "refresh_token",
-        "refresh_token": refresh_token
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-    try:
-        response = requests.post(DISCORD_TOKEN_URL, data=data, headers=headers, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-        else:
-            print(f"[DEBUG] Refresh Token 실패: {response.status_code} - {response.text[:200]}")
-            return None
-    except Exception as e:
-        print(f"[DEBUG] Refresh Token 예외: {e}")
-        return None
-
 def get_discord_user(access_token):
     headers = {"Authorization": f"Bearer {access_token}"}
     response = requests.get(f"{DISCORD_API_BASE}/users/@me", headers=headers)
@@ -133,38 +109,33 @@ def get_user_guilds(access_token):
     response = requests.get(f"{DISCORD_API_BASE}/users/@me/guilds", headers=headers)
     return response.json()
 
-def add_user_to_guild_with_oauth(access_token, guild_id, user_id):
+# ✅ 봇 토큰 방식으로 서버 추가 (본문 없이)
+def add_user_to_guild_with_bot(bot_token, guild_id, user_id):
     """
-    OAuth2 토큰을 사용해 사용자를 서버에 강제 추가
+    봇 토큰을 사용해 사용자를 서버에 강제 추가
     API 문서: https://discord.com/developers/docs/resources/guild#add-guild-member
     """
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "access_token": access_token
+        "Authorization": f"Bot {bot_token}"
     }
     try:
-        response = requests.put(url, headers=headers, json=payload)
+        response = requests.put(url, headers=headers)
         
-        print(f"[DEBUG] add_user_to_guild_with_oauth 응답: {response.status_code} - {response.text[:500]}")
+        print(f"[DEBUG] add_user_to_guild_with_bot 응답: {response.status_code} - {response.text[:500]}")
         
         if response.status_code == 201:
-            return True, "새로 추가됨", None
+            return True, "새로 추가됨"
         elif response.status_code == 204:
-            return True, "이미 존재함", None
-        elif response.status_code == 401:
-            return False, "토큰 만료", "refresh_needed"
+            return True, "이미 존재함"
         else:
             error_text = response.text[:500]
             if "Missing Permissions" in error_text:
-                return False, f"봇에 '서버 멤버 관리' 또는 '관리자' 권한이 없습니다. (HTTP {response.status_code})", None
+                return False, f"봇에 '서버 멤버 관리' 권한이 없습니다. (HTTP {response.status_code})"
             else:
-                return False, f"HTTP {response.status_code}: {error_text}", None
+                return False, f"HTTP {response.status_code}: {error_text}"
     except Exception as e:
-        return False, str(e), None
+        return False, str(e)
 
 # ============================================================
 # 봇 팩토리 함수
@@ -402,10 +373,13 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
         await ctx.send(f"✅ {removed_count}명의 사용자에게서 인증 역할이 제거되었습니다.")
 
+    # ============================================================
+    # ✅ !복구 - 봇 토큰 방식 (OAuth2 필요 없음, 영원히 안 만료됨)
+    # ============================================================
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
-        """인증된 모든 사용자를 OAuth2 토큰으로 서버에 강제 초대 (Refresh Token 자동 갱신)"""
+        """인증된 모든 사용자를 봇 토큰으로 서버에 강제 초대 (토큰 만료 없음)"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
@@ -414,19 +388,15 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             await ctx.send("ℹ️ 인증된 사용자가 없습니다.")
             return
 
-        await ctx.send(f"🔄 {len(guild_verified)}명의 사용자를 서버에 강제 추가하는 중...")
+        await ctx.send(f"🔄 {len(guild_verified)}명의 사용자를 서버에 강제 추가하는 중... (봇 토큰 방식)")
 
         added_new = 0
         already_exist = 0
         failed = 0
-        token_refreshed = 0
-        refresh_failed = 0
         results = []
 
         for user_data in guild_verified:
             user_id = user_data["user_id"]
-            access_token = user_data.get("access_token")
-            refresh_token = user_data.get("refresh_token")
             
             try:
                 existing = guild.get_member(user_id)
@@ -435,55 +405,9 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                if not access_token:
-                    failed += 1
-                    results.append(f"❌ {user_id}: OAuth2 토큰 없음 (재인증 필요)")
-                    continue
-                
-                # ✅ 1차 시도: 현재 Access Token으로 요청
-                success, msg, error_type = add_user_to_guild_with_oauth(access_token, guild.id, user_id)
-                
-                # ✅ 토큰 만료 시 Refresh Token으로 갱신 시도
-                if not success and error_type == "refresh_needed":
-                    if refresh_token:
-                        print(f"[DEBUG] {user_id} 토큰 만료, Refresh Token으로 갱신 시도...")
-                        new_token_data = refresh_access_token(refresh_token)
-                        
-                        if new_token_data and new_token_data.get("access_token"):
-                            new_access_token = new_token_data.get("access_token")
-                            new_refresh_token = new_token_data.get("refresh_token", refresh_token)
-                            
-                            # ✅ 2차 시도: 새 Access Token으로 요청
-                            success2, msg2, error_type2 = add_user_to_guild_with_oauth(new_access_token, guild.id, user_id)
-                            
-                            if success2:
-                                # ✅ 성공 시 새 토큰 저장
-                                for i, u in enumerate(verified_users[str(guild.id)]):
-                                    if u["user_id"] == user_id:
-                                        verified_users[str(guild.id)][i]["access_token"] = new_access_token
-                                        verified_users[str(guild.id)][i]["refresh_token"] = new_refresh_token
-                                        break
-                                token_refreshed += 1
-                                success = True
-                                msg = msg2
-                                if "새로" in msg:
-                                    added_new += 1
-                                    results.append(f"✅ {user_id}: 새로 추가됨 (토큰 갱신)")
-                                else:
-                                    already_exist += 1
-                                    results.append(f"ℹ️ {user_id}: 이미 존재함 (토큰 갱신)")
-                            else:
-                                refresh_failed += 1
-                                results.append(f"⚠️ {user_id}: Refresh Token으로도 실패 - {msg2}")
-                                failed += 1
-                        else:
-                            refresh_failed += 1
-                            results.append(f"⚠️ {user_id}: Refresh Token 갱신 실패 - 재인증 필요")
-                            failed += 1
-                    else:
-                        results.append(f"⚠️ {user_id}: Refresh Token 없음 - 재인증 필요")
-                        failed += 1
-                elif success:
+                # ✅ 봇 토큰으로 강제 추가 (OAuth2 필요 없음)
+                success, msg = add_user_to_guild_with_bot(bot.bot_token, guild.id, user_id)
+                if success:
                     if "새로" in msg:
                         added_new += 1
                         results.append(f"✅ {user_id}: 새로 추가됨")
@@ -493,7 +417,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 else:
                     failed += 1
                     results.append(f"❌ {user_id}: {msg}")
-                
                 await asyncio.sleep(0.5)
             except Exception as e:
                 failed += 1
@@ -503,17 +426,9 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             f"✅ 복구 완료!\n"
             f"• 새로 추가: {added_new}명\n"
             f"• 이미 존재: {already_exist}명\n"
-            f"• 실패: {failed}명\n"
-            f"• 토큰 자동 갱신: {token_refreshed}명\n"
-            f"• 갱신 실패: {refresh_failed}명"
+            f"• 실패: {failed}명"
         )
         await ctx.send(summary)
-
-        if refresh_failed > 0:
-            await ctx.send(
-                f"⚠️ {refresh_failed}명의 사용자 토큰 갱신에 실패했습니다.\n"
-                f"재인증을 위해 `?콘솔생성`으로 새 인증 링크를 발급받아주세요."
-            )
 
         if results:
             result_text = "\n".join(results)
@@ -529,8 +444,8 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             if log_channel:
                 now_kst = datetime.now(KST)
                 embed = discord.Embed(
-                    title="📨 복구 실행됨 (OAuth2 + 자동 갱신)",
-                    description=f"총 {len(guild_verified)}명 처리 완료",
+                    title="📨 복구 실행됨 (봇 토큰 방식)",
+                    description=f"총 {len(guild_verified)}명 처리 완료 (토큰 만료 없음)",
                     color=discord.Color.blue(),
                     timestamp=datetime.now(timezone.utc)
                 )
@@ -538,8 +453,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 embed.add_field(name="새로 추가", value=str(added_new), inline=True)
                 embed.add_field(name="이미 존재", value=str(already_exist), inline=True)
                 embed.add_field(name="실패", value=str(failed), inline=True)
-                embed.add_field(name="토큰 자동 갱신", value=str(token_refreshed), inline=True)
-                embed.add_field(name="갱신 실패", value=str(refresh_failed), inline=True)
                 try:
                     await log_channel.send(embed=embed)
                 except:
@@ -618,7 +531,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 )
                 embed.add_field(
                     name="📋 필요 권한",
-                    value="• 이메일 보기\n• 서버에 참가하기\n• 참가한 서버 확인하기",
+                    value="• 이메일 보기\n• 기본 정보 확인",
                     inline=False
                 )
                 embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
@@ -685,7 +598,7 @@ def oauth2_login():
             "client_id": DISCORD_CLIENT_ID,
             "redirect_uri": DISCORD_REDIRECT_URI,
             "response_type": "code",
-            "scope": "identify email guilds guilds.join",
+            "scope": "identify email",
             "state": state
         }
         oauth_url = f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -723,7 +636,6 @@ def oauth2_callback():
             return f"❌ 토큰 교환 실패: {token_data}", 400
         
         access_token = token_data['access_token']
-        refresh_token = token_data.get('refresh_token')
         user_data = get_discord_user(access_token)
         
         if 'id' not in user_data:
@@ -734,7 +646,6 @@ def oauth2_callback():
         session['user_avatar'] = user_data.get('avatar')
         session['user_email'] = user_data.get('email')
         session['access_token'] = access_token
-        session['refresh_token'] = refresh_token
         session['user_data'] = user_data
         
         session['pending_guild_id'] = int(state_data.get('guild_id')) if state_data.get('guild_id') else None
@@ -909,7 +820,6 @@ def captcha_page():
         user_avatar = session.get('user_avatar')
         user_email = session.get('user_email')
         access_token = session.get('access_token')
-        refresh_token = session.get('refresh_token')
         user_data = session.get('user_data', {})
         
         if request.method == 'GET':
@@ -1000,7 +910,7 @@ def captcha_page():
         future = asyncio.run_coroutine_threadsafe(
             assign_role_from_web_wrapper(
                 token, ip, guild_id, int(user_id), target_bot,
-                user_data, access_token, refresh_token, user_agent
+                user_data, user_agent
             ),
             target_bot.loop
         )
@@ -1056,9 +966,9 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼 (refresh_token 저장)
+# 웹 인증 처리 래퍼 (access_token만 저장, 복구는 봇 토큰 사용)
 # ============================================================
-async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, refresh_token, user_agent):
+async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, user_agent):
     try:
         guild = bot_instance.get_guild(guild_id)
         if not guild:
@@ -1089,37 +999,22 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
         await member.add_roles(role, reason="웹 인증 완료")
 
+        # user_id만 저장 (복구는 봇 토큰으로 처리)
         guild_key = str(guild_id)
         if guild_key not in verified_users:
             verified_users[guild_key] = []
-        if not any(u["user_id"] == user_id for u in verified_users[guild_key]):
+        if user_id not in [u["user_id"] for u in verified_users[guild_key]]:
             verified_users[guild_key].append({
-                "user_id": user_id,
-                "access_token": access_token,
-                "refresh_token": refresh_token
+                "user_id": user_id
             })
-        else:
-            # 이미 존재하면 토큰 업데이트
-            for i, u in enumerate(verified_users[guild_key]):
-                if u["user_id"] == user_id:
-                    verified_users[guild_key][i]["access_token"] = access_token
-                    verified_users[guild_key][i]["refresh_token"] = refresh_token
-                    break
 
-        # 사용자 서버 목록
+        # 사용자 서버 목록 (선택적)
         user_guilds = []
         guilds_file = None
-        if access_token:
+        if user_data:
             try:
-                guilds_data = get_user_guilds(access_token)
-                user_guilds = [f"{g['name']} ({g['id']})" for g in guilds_data]
-                
-                if user_guilds:
-                    guilds_text = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
-                    guilds_file = discord.File(
-                        io.BytesIO(guilds_text.encode('utf-8')),
-                        filename=f"서버목록_{user_id}_{int(time.time())}.txt"
-                    )
+                # user_data에는 access_token이 없으므로 서버 목록은 생략
+                pass
             except Exception as e:
                 print(f"서버 목록 가져오기 실패: {e}")
 
@@ -1204,11 +1099,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                     inline=False
                 )
                 embed.add_field(
-                    name="참가 서버 수",
-                    value=f"{len(user_guilds)}개" + (" (파일 참조)" if guilds_file else ""),
-                    inline=False
-                )
-                embed.add_field(
                     name="예상 복구 인원",
                     value=f"{len(verified_users.get(guild_key, []))} 명",
                     inline=False
@@ -1216,10 +1106,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 embed.set_thumbnail(url=member.display_avatar.url)
                 
                 try:
-                    if guilds_file:
-                        await log_channel.send(embed=embed, file=guilds_file)
-                    else:
-                        await log_channel.send(embed=embed)
+                    await log_channel.send(embed=embed)
                 except Exception as e:
                     print(f"로그 전송 오류: {e}")
 
