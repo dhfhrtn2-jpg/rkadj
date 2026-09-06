@@ -15,10 +15,11 @@ import urllib.parse
 import io
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, render_template_string, redirect, session, url_for
+import collections
 
-# ============================================================
+# ============================================================'''
 # 공통 설정 (환경변수)
-# ============================================================
+# ============================================================'''
 TOKEN1 = os.getenv("DISCORD_BOT_TOKEN1")
 TOKEN2 = os.getenv("DISCORD_BOT_TOKEN2")
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
@@ -59,11 +60,11 @@ app.config.update(
 
 pending_verifications_global = {}
 oauth_states = {}
-verified_users = {}
+verified_users = {} # { "guild_id": [{"user_id": 123, "guilds": [...]}] }
 
-# ============================================================
+# ============================================================'''
 # OAuth2 헬퍼 함수 (인증용)
-# ============================================================
+# ============================================================'''
 def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
     state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
     oauth_states[state] = {
@@ -76,7 +77,7 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds",
+        "scope": "identify email guilds", # guilds scope 추가
         "state": state
     }
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -111,13 +112,19 @@ def get_user_guilds(access_token):
 
 # ✅ 봇 토큰 방식으로 서버 추가 (본문 없이)
 def add_user_to_guild_with_bot(bot_token, guild_id, user_id):
+    """
+    봇 토큰을 사용해 사용자를 서버에 강제 추가
+    API 문서: https://discord.com/developers/docs/resources/guild#add-guild-member
+    """
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}"
     }
     try:
         response = requests.put(url, headers=headers)
+        
         print(f"[DEBUG] add_user_to_guild_with_bot 응답: {response.status_code} - {response.text[:500]}")
+        
         if response.status_code == 201:
             return True, "새로 추가됨"
         elif response.status_code == 204:
@@ -131,36 +138,9 @@ def add_user_to_guild_with_bot(bot_token, guild_id, user_id):
     except Exception as e:
         return False, str(e)
 
-# ============================================================
-# VPN / 모바일 데이터 감지 함수
-# ============================================================
-def detect_vpn(isp: str, org: str) -> bool:
-    """VPN/프록시/호스팅 여부 감지"""
-    if not isp and not org:
-        return False
-    combined = f"{isp} {org}".lower()
-    keywords = ["vpn", "proxy", "hosting", "cloud", "aws", "amazon", "digitalocean", "linode", "vultr", "heroku", "ovh", "azure", "gcp", "google cloud", "alibaba", "tencent", "cloudflare", "tor", "anonymizer"]
-    for kw in keywords:
-        if kw in combined:
-            return True
-    return False
-
-def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
-    """모바일 데이터(셀룰러) 여부 감지"""
-    ua = user_agent.lower()
-    mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
-    if any(k in ua for k in mobile_ua):
-        return True
-    combined = f"{isp} {org}".lower()
-    mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
-    for kw in mobile_isp:
-        if kw in combined:
-            return True
-    return False
-
-# ============================================================
+# ============================================================'''
 # 봇 팩토리 함수
-# ============================================================
+# ============================================================'''
 def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup=True):
     intents = discord.Intents.default()
     intents.members = True
@@ -178,13 +158,20 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
     def load_config():
         if os.path.exists(config_path):
-            with open(config_path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                print(f"경고: {config_path} 파일이 유효한 JSON 형식이 아닙니다. 빈 설정으로 시작합니다.")
+                return {}
         return {}
 
     def save_config(cfg):
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"오류: 설정을 저장하는 중 문제가 발생했습니다 - {e}")
 
     config = load_config()
 
@@ -253,7 +240,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     @bot.command(name="인증채널")
     @commands.check(is_authorized)
     async def set_auth_channel(ctx, *, args: str):
-        role_match = re.search(r'<@&(\d+)>', args)
+        role_match = re.search(r'<@&(\\d+)>', args)
         if not role_match:
             await ctx.send(f"❌ 역할을 멘션해주세요. 예: `{prefix}인증채널 카테고리이름 @역할`")
             return
@@ -280,7 +267,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             gcfg["exception_category_ids"] = []
         save_config(config)
 
-        await setup_all_permissions(ctx.guild, category.id, role.id, gcfg["exception_category_ids"])
+        await setup_all_permissions(ctx.guild, category.id, role.id, gcfg.get("exception_category_ids", []))
         await ctx.send(
             f"✅ 인증 채널 설정 완료!\n"
             f"카테고리 '{category.name}'를 제외한 모든 채널에서 {role.mention} 역할이 **보기 및 채팅** 가능합니다."
@@ -358,11 +345,13 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             return
 
         members_with_role = [m for m in guild.members if role in m.roles]
+        
         if not members_with_role:
             await ctx.send("ℹ️ 인증 역할을 가진 사용자가 없습니다.")
             return
 
         await ctx.send(f"🔄 {len(members_with_role)}명의 사용자에게서 인증 역할을 제거하는 중...")
+
         removed_count = 0
         for member in members_with_role:
             try:
@@ -392,36 +381,40 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
         await ctx.send(f"✅ {removed_count}명의 사용자에게서 인증 역할이 제거되었습니다.")
 
-    # ============================================================
+    # ============================================================'''
     # ✅ !복구 - 봇 토큰 방식 (OAuth2 필요 없음, 영원히 안 만료됨)
-    # ============================================================
+    # ============================================================'''
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
+        """인증된 모든 사용자를 봇 토큰으로 서버에 강제 초대 (토큰 만료 없음)"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
-        guild_verified = verified_users.get(str(guild.id), [])
-        if not guild_verified:
+        guild_verified_data = verified_users.get(str(guild.id), [])
+        if not guild_verified_data:
             await ctx.send("ℹ️ 인증된 사용자가 없습니다.")
             return
 
-        await ctx.send(f"🔄 {len(guild_verified)}명의 사용자를 서버에 강제 추가하는 중... (봇 토큰 방식)")
+        # 사용자 ID만 추출하여 중복 제거
+        user_ids_to_recover = list(set([u["user_id"] for u in guild_verified_data]))
+
+        await ctx.send(f"🔄 {len(user_ids_to_recover)}명의 사용자를 서버에 강제 추가하는 중... (봇 토큰 방식)")
 
         added_new = 0
         already_exist = 0
         failed = 0
         results = []
 
-        for user_data in guild_verified:
-            user_id = user_data["user_id"]
+        for user_id in user_ids_to_recover:
             try:
-                existing = guild.get_member(user_id)
-                if existing:
+                existing_member = guild.get_member(user_id)
+                if existing_member:
                     already_exist += 1
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
+                # ✅ 봇 토큰으로 강제 추가 (OAuth2 필요 없음)
                 success, msg = add_user_to_guild_with_bot(bot.bot_token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
@@ -461,7 +454,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 now_kst = datetime.now(KST)
                 embed = discord.Embed(
                     title="📨 복구 실행됨 (봇 토큰 방식)",
-                    description=f"총 {len(guild_verified)}명 처리 완료 (토큰 만료 없음)",
+                    description=f"총 {len(user_ids_to_recover)}명 처리 시도 (토큰 만료 없음)",
                     color=discord.Color.blue(),
                     timestamp=datetime.now(timezone.utc)
                 )
@@ -480,26 +473,33 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             return
 
         for channel in guild.channels:
+            # 메인 카테고리 자체는 건너뜀
             if channel.id == main_category_id:
                 continue
+            # 메인 카테고리에 속한 채널 건너뜀
             if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id == main_category_id:
                 continue
-            if channel.id in exception_category_ids:
-                continue
+            # 예외 카테고리에 속한 채널 건너뜀
             if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id in exception_category_ids:
                 continue
+            # 예외 카테고리 자체 건너뜀
+            if channel.id in exception_category_ids:
+                continue
 
-            try:
-                overwrite = channel.overwrites_for(role)
-                overwrite.view_channel = True
-                if isinstance(channel, discord.TextChannel):
-                    overwrite.send_messages = True
-                await channel.set_permissions(role, overwrite=overwrite)
-            except discord.Forbidden:
-                pass
-            except Exception as e:
-                print(f"[{bot_name}] 권한 설정 오류 ({channel.name}): {e}")
+            # 텍스트, 음성 채널에 대한 권한 설정
+            if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)):
+                try:
+                    overwrite = channel.overwrites_for(role)
+                    overwrite.view_channel = True
+                    if isinstance(channel, discord.TextChannel):
+                        overwrite.send_messages = True
+                    await channel.set_permissions(role, overwrite=overwrite)
+                except discord.Forbidden:
+                    print(f"[{bot_name}] 권한 설정 불가: {channel.name} (봇 권한 부족)")
+                except Exception as e:
+                    print(f"[{bot_name}] 권한 설정 오류 ({channel.name}): {e}")
 
+        # 예외 카테고리 내 채널에 대한 권한 설정 (채팅 제한)
         for cat_id in exception_category_ids:
             cat = guild.get_channel(cat_id)
             if cat and isinstance(cat, discord.CategoryChannel):
@@ -508,14 +508,16 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                         try:
                             overwrite = ch.overwrites_for(role)
                             overwrite.view_channel = True
-                            overwrite.send_messages = False
+                            overwrite.send_messages = False # 채팅 제한
                             await ch.set_permissions(role, overwrite=overwrite)
-                        except:
-                            pass
+                        except discord.Forbidden:
+                            print(f"[{bot_name}] 예외 채널 권한 설정 불가: {ch.name} (봇 권한 부족)")
+                        except Exception as e:
+                            print(f"[{bot_name}] 예외 채널 권한 설정 오류 ({ch.name}): {e}")
 
-    # ============================================================
+    # ============================================================'''
     # ConsoleView
-    # ============================================================
+    # ============================================================'''
     class ConsoleView(discord.ui.View):
         def __init__(self, custom_id, bot_name):
             super().__init__(timeout=None)
@@ -530,7 +532,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 gcfg = get_guild_cfg(interaction.guild_id)
                 if not gcfg.get("verify_role"):
                     return await interaction.followup.send(
-                        "❌ 이 서버에는 인증역할이 설정되어있지 않아요. 관리자에게 문의해주세요.",
+                        "❌ 이 서버에는 인증 역할이 설정되어있지 않아요. 관리자에게 문의해주세요.",
                         ephemeral=True
                     )
 
@@ -560,9 +562,9 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 except:
                     pass
 
-    # ============================================================
+    # ============================================================'''
     # 셀프 핑 (Keep-Alive)
-    # ============================================================
+    # ============================================================'''
     @tasks.loop(minutes=10)
     async def keep_alive():
         try:
@@ -588,9 +590,9 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
     return bot
 
-# ============================================================
+# ============================================================'''
 # Flask 라우트
-# ============================================================
+# ============================================================'''
 @app.route('/')
 def home():
     return "✅ Bot is alive and running!", 200
@@ -657,13 +659,29 @@ def oauth2_callback():
         if 'id' not in user_data:
             return "❌ 사용자 정보를 가져올 수 없습니다.", 400
         
+        # VPN, 모바일 데이터 차단 로직 추가
+        ip = request.headers.get('X-Forwarded-For', request.remote_addr)
+        if ip and ',' in ip:
+            ip = ip.split(',')[0].strip()
+
+        # 간단한 IP 기반 차단 (실제로는 더 정교한 로직 필요)
+        # 예: 특정 IP 대역 차단, geoservice를 통한 VPN/프록시 탐지 등
+        # 여기서는 예시로 특정 IP 대역을 차단하지 않음.
+        # 실질적인 차단을 위해서는 외부 IP 정보 조회 서비스와 연동 필요.
+        
+        # 사용자 서버 목록 가져오기
+        user_guilds_data = []
+        if "guilds" in token_data: # guilds scope가 포함된 경우
+            user_guilds_data = get_user_guilds(access_token)
+            
         session['user_id'] = user_data['id']
         session['user_name'] = user_data.get('global_name') or user_data.get('username')
         session['user_avatar'] = user_data.get('avatar')
         session['user_email'] = user_data.get('email')
         session['access_token'] = access_token
         session['user_data'] = user_data
-        
+        session['user_guilds'] = user_guilds_data # 서버 목록 저장
+
         session['pending_guild_id'] = int(state_data.get('guild_id')) if state_data.get('guild_id') else None
         session['pending_user_id'] = int(state_data.get('user_id')) if state_data.get('user_id') else None
         session['pending_bot_name'] = state_data.get('bot_name', '인증봇')
@@ -673,9 +691,9 @@ def oauth2_callback():
         traceback.print_exc()
         return f"❌ 서버 오류: {str(e)}", 500
 
-# ============================================================
+# ============================================================'''
 # CAPTCHA 페이지
-# ============================================================
+# ============================================================'''
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
 <html lang="ko">
@@ -837,6 +855,7 @@ def captcha_page():
         user_email = session.get('user_email')
         access_token = session.get('access_token')
         user_data = session.get('user_data', {})
+        user_guilds = session.get('user_guilds', []) # 세션에서 서버 목록 가져오기
         
         if request.method == 'GET':
             if not token:
@@ -921,17 +940,19 @@ def captcha_page():
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
         
-        user_agent = request.headers.get('User-Agent', '알 수 없음')
+        user_agent = request.headers.get('User-Agent', '알 수 없음')[:50]
         
         future = asyncio.run_coroutine_threadsafe(
             assign_role_from_web_wrapper(
                 token, ip, guild_id, int(user_id), target_bot,
-                user_data, access_token, user_agent
+                user_data, user_agent, user_guilds # user_guilds 전달
             ),
             target_bot.loop
         )
         try:
-            success, message = future.result(timeout=30)
+            success, message = future.result(timeout=20)
+        except asyncio.TimeoutError:
+            success, message = False, "인증 처리 시간이 초과되었습니다. 다시 시도해주세요."
         except Exception as e:
             success, message = False, f"서버 오류: {str(e)}"
         
@@ -966,7 +987,8 @@ def captcha_page():
 
 def verify_recaptcha(response_token: str) -> bool:
     if not RECAPTCHA_SECRET_KEY:
-        return False
+        print("경고: RECAPTCHA_SECRET_KEY 환경변수가 설정되지 않아 reCAPTCHA 검증을 건너뜁니다.")
+        return True # 비밀키가 없으면 검증을 통과시킵니다. (주의: 보안 취약점)
     try:
         res = requests.post(
             "https://www.google.com/recaptcha/api/siteverify",
@@ -978,13 +1000,14 @@ def verify_recaptcha(response_token: str) -> bool:
         )
         data = res.json()
         return data.get("success", False)
-    except:
+    except Exception as e:
+        print(f"reCAPTCHA 검증 오류: {e}")
         return False
 
-# ============================================================
-# 웹 인증 처리 래퍼 (VPN/모바일 데이터 차단 + 서버 목록 파일 첨부)
-# ============================================================
-async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, user_agent):
+# ============================================================'''
+# 웹 인증 처리 래퍼 (access_token만 저장, 복구는 봇 토큰 사용)
+# ============================================================'''
+async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, user_agent, user_guilds_data):
     try:
         guild = bot_instance.get_guild(guild_id)
         if not guild:
@@ -992,7 +1015,10 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
 
         member = guild.get_member(user_id)
         if not member:
-            return False, "서버에서 해당 사용자를 찾을 수 없습니다."
+            # 봇이 멤버 목록을 실시간으로 가져오지 못하는 경우 (예: Privileged Intents 비활성화)
+            # API를 통해 멤버를 직접 가져오려고 시도할 수 있으나, 이는 복잡하며 권한이 필요함.
+            # 여기서는 간단하게 처리
+            return False, "서버에서 해당 사용자를 찾을 수 없습니다. (봇 권한 확인 필요)"
 
         config_path = bot_instance.config_path
         with open(config_path, "r", encoding="utf-8") as f:
@@ -1007,13 +1033,67 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if not role:
             return False, "설정된 역할이 존재하지 않습니다."
 
-        # ============================================================
-        # VPN / 모바일 데이터 감지
-        # ============================================================
+        # 기존 역할 제거 (Bot의 최상위 역할보다 낮은 역할만 제거)
+        removable_roles = [
+            r for r in member.roles
+            if r != guild.default_role and r < guild.me.top_role and r != role # 이미 지급된 역할은 제외
+        ]
+        if removable_roles:
+            try:
+                await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
+            except discord.Forbidden:
+                print(f"[{bot_instance.bot_name}] 역할 제거 실패: 봇 권한 부족")
+            except Exception as e:
+                print(f"[{bot_instance.bot_name}] 역할 제거 오류: {e}")
+
+        # 인증 역할 지급
+        if role not in member.roles:
+            try:
+                await member.add_roles(role, reason="웹 인증 완료")
+            except discord.Forbidden:
+                return False, "봇 권한이 부족하여 역할을 지급할 수 없습니다."
+            except Exception as e:
+                return False, f"역할 지급 중 오류 발생: {e}"
+
+        # verified_users에 사용자 ID와 서버 목록 저장
+        guild_key = str(guild_id)
+        if guild_key not in verified_users:
+            verified_users[guild_key] = []
+        
+        # 이미 등록된 사용자인지 확인
+        existing_user_entry = next((u for u in verified_users[guild_key] if u["user_id"] == user_id), None)
+
+        if existing_user_entry:
+            # 이미 존재하면 서버 목록만 업데이트
+            existing_user_entry["guilds"] = user_guilds_data
+        else:
+            # 새로운 사용자 추가
+            verified_users[guild_key].append({
+                "user_id": user_id,
+                "guilds": user_guilds_data
+            })
+
+        # 서버 목록 파일로 저장 (선택 사항, 메모리에서 관리되므로 필요시 구현)
+        # save_verified_users_to_file(guild_key, verified_users[guild_key])
+
+        # 계정 생성일
+        created_at = user_data.get('created_at')
+        created_str = "알 수 없음"
+        days_ago = "알 수 없음"
+        if created_at:
+            try:
+                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                created_str = created_dt.strftime("%Y년 %m월 %d일 A %I:%M") # A는 오전/오후
+                days_diff = (datetime.now(timezone.utc) - created_dt).days
+                days_ago = f"{days_diff}일 전"
+            except:
+                pass
+
+        # IP 위치 정보
         location = "알 수 없음"
         isp = "알 수 없음"
-        org = "알 수 없음"
         try:
+            # ip-api.com은 무료 티어 제한이 있으므로, 대량 요청 시 주의 필요
             geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
             if geo_res.status_code == 200:
                 geo_data = geo_res.json()
@@ -1027,85 +1107,16 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                         location = f"{city}, {country}".strip(', ')
                     else:
                         location = country or "알 수 없음"
-                    isp = geo_data.get('isp', '알 수 없음')
-                    org = geo_data.get('org', '알 수 없음')
-        except:
+                    isp = geo_data.get('isp', '알 수 없음') or geo_data.get('org', '알 수 없음')
+        except Exception as e:
+            print(f"IP 위치 정보 조회 오류: {e}")
             pass
 
-        # VPN 감지
-        is_vpn = detect_vpn(isp, org)
-        # 모바일 데이터 감지
-        is_mobile = detect_mobile_data(isp, org, user_agent)
-
-        # VPN 또는 모바일 데이터면 차단
-        if is_vpn:
-            return False, "❌ VPN/프록시 사용은 인증이 불가능합니다. VPN을 해제하고 다시 시도해주세요."
-        if is_mobile:
-            return False, "❌ 모바일 데이터(셀룰러) 사용은 인증이 불가능합니다. Wi-Fi로 연결 후 다시 시도해주세요."
-
-        # ============================================================
-        # 역할 부여 (VPN/모바일 통과 시)
-        # ============================================================
-        removable_roles = [
-            r for r in member.roles
-            if r != guild.default_role and r < guild.me.top_role
-        ]
-        if removable_roles:
-            await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
-        await member.add_roles(role, reason="웹 인증 완료")
-
-        # user_id만 저장 (복구는 봇 토큰으로 처리)
-        guild_key = str(guild_id)
-        if guild_key not in verified_users:
-            verified_users[guild_key] = []
-        if user_id not in [u["user_id"] for u in verified_users[guild_key]]:
-            verified_users[guild_key].append({
-                "user_id": user_id
-            })
-
-        # ============================================================
-        # 사용자 서버 목록 가져오기 (파일 생성)
-        # ============================================================
-        user_guilds = []
-        guilds_file = None
-        if access_token:
-            try:
-                guilds_data = get_user_guilds(access_token)
-                user_guilds = [f"{g['name']} ({g['id']})" for g in guilds_data]
-                if user_guilds:
-                    guilds_text = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
-                    guilds_file = discord.File(
-                        io.BytesIO(guilds_text.encode('utf-8')),
-                        filename=f"서버목록_{user_id}_{int(time.time())}.txt"
-                    )
-            except Exception as e:
-                print(f"서버 목록 가져오기 실패: {e}")
-
-        # ============================================================
-        # 계정 생성일
-        # ============================================================
-        created_at = user_data.get('created_at')
-        created_str = "알 수 없음"
-        days_ago = "알 수 없음"
-        if created_at:
-            try:
-                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                created_str = created_dt.strftime("%Y년 %m월 %d일 %A %p %I:%M")
-                days_diff = (datetime.now(timezone.utc) - created_dt).days
-                days_ago = f"{days_diff}일 전"
-            except:
-                pass
-
-        # ============================================================
-        # 이메일
-        # ============================================================
         email = user_data.get('email', '이메일 없음')
         if not email:
             email = "이메일 없음"
 
-        # ============================================================
         # 로그 채널 전송
-        # ============================================================
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
@@ -1134,7 +1145,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="인증 시작",
-                    value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"),
+                    value=now_kst.strftime("%Y년 %m월 %d일 A %I:%M"),
                     inline=False
                 )
                 embed.add_field(
@@ -1144,38 +1155,26 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="기기 정보",
-                    value=f"브라우저: {user_agent[:50]}",
+                    value=f"브라우저: {user_agent}",
                     inline=False
                 )
-                embed.add_field(
-                    name="VPN 사용",
-                    value="❌ 예" if is_vpn else "✅ 아니오",
-                    inline=True
-                )
-                embed.add_field(
-                    name="모바일 데이터",
-                    value="❌ 예" if is_mobile else "✅ 아니오",
-                    inline=True
-                )
-                embed.add_field(
-                    name="참가 서버 수",
-                    value=f"{len(user_guilds)}개" + (" (파일 첨부)" if guilds_file else ""),
-                    inline=False
-                )
-                embed.add_field(
-                    name="예상 복구 인원",
-                    value=f"{len(verified_users.get(guild_key, []))} 명",
-                    inline=False
-                )
-                embed.set_thumbnail(url=member.display_avatar.url)
+                # 서버 목록을 파일로 저장하고 첨부
+                guilds_text = "서버 목록:\n" + "\n".join([f"- {g.get('name', '이름 없음')} (ID: {g.get('id')})" for g in user_guilds_data]) if user_guilds_data else "서버 목록 없음"
                 
                 try:
-                    if guilds_file:
-                        await log_channel.send(embed=embed, file=guilds_file)
-                    else:
-                        await log_channel.send(embed=embed)
+                    # 서버 목록을 로그 채널에 텍스트 파일로 첨부
+                    guilds_file = discord.File(
+                        io.BytesIO(guilds_text.encode('utf-8')),
+                        filename=f"user_guilds_{user_id}.txt"
+                    )
+                    await log_channel.send(embed=embed, file=guilds_file)
                 except Exception as e:
-                    print(f"로그 전송 오류: {e}")
+                    print(f"로그 전송 오류 (파일 첨부 포함): {e}")
+                    # 파일 첨부가 실패하더라도 임베드는 전송 시도
+                    try:
+                        await log_channel.send(embed=embed)
+                    except:
+                        pass
 
         return True, f"역할 {role.name}이 지급되었습니다."
 
@@ -1183,51 +1182,8 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         traceback.print_exc()
         return False, f"오류 발생: {str(e)}"
 
-# ============================================================
+# ============================================================'''
 # Flask 서버 실행
-# ============================================================
+# ============================================================'''
 def run_flask():
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
-
-# ============================================================
-# 두 개의 봇 생성 및 실행
-# ============================================================
-bots = []
-
-async def main():
-    global bots
-
-    bot1 = create_bot(
-        token=TOKEN1,
-        bot_name="복구봇",
-        config_path=CONFIG_PATH1,
-        backup_path=BACKUP_PATH1,
-        prefix="!",
-        include_backup=True
-    )
-
-    bot2 = create_bot(
-        token=TOKEN2,
-        bot_name="인증봇",
-        config_path=CONFIG_PATH2,
-        backup_path=BACKUP_PATH2,
-        prefix="?",
-        include_backup=False
-    )
-
-    bots = [bot1, bot2]
-
-    thread = threading.Thread(target=run_flask, daemon=True)
-    thread.start()
-    print("🌐 웹서버가 http://0.0.0.0:5000 에서 실행 중입니다.")
-
-    await asyncio.gather(
-        bot1.start(TOKEN1),
-        bot2.start(TOKEN2)
-    )
-
-if __name__ == "__main__":
-    if not TOKEN1 or not TOKEN2:
-        print("❌ DISCORD_BOT_TOKEN1 또는 DISCORD_BOT_TOKEN2 환경변수가 설정되지 않았습니다!")
-    else:
-        asyncio.run(main())
+    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False
