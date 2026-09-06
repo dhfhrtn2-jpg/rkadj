@@ -111,19 +111,13 @@ def get_user_guilds(access_token):
 
 # ✅ 봇 토큰 방식으로 서버 추가 (본문 없이)
 def add_user_to_guild_with_bot(bot_token, guild_id, user_id):
-    """
-    봇 토큰을 사용해 사용자를 서버에 강제 추가
-    API 문서: https://discord.com/developers/docs/resources/guild#add-guild-member
-    """
     url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}"
     }
     try:
         response = requests.put(url, headers=headers)
-        
         print(f"[DEBUG] add_user_to_guild_with_bot 응답: {response.status_code} - {response.text[:500]}")
-        
         if response.status_code == 201:
             return True, "새로 추가됨"
         elif response.status_code == 204:
@@ -136,6 +130,33 @@ def add_user_to_guild_with_bot(bot_token, guild_id, user_id):
                 return False, f"HTTP {response.status_code}: {error_text}"
     except Exception as e:
         return False, str(e)
+
+# ============================================================
+# VPN / 모바일 데이터 감지 함수
+# ============================================================
+def detect_vpn(isp: str, org: str) -> bool:
+    """VPN/프록시/호스팅 여부 감지"""
+    if not isp and not org:
+        return False
+    combined = f"{isp} {org}".lower()
+    keywords = ["vpn", "proxy", "hosting", "cloud", "aws", "amazon", "digitalocean", "linode", "vultr", "heroku", "ovh", "azure", "gcp", "google cloud", "alibaba", "tencent", "cloudflare", "tor", "anonymizer"]
+    for kw in keywords:
+        if kw in combined:
+            return True
+    return False
+
+def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
+    """모바일 데이터(셀룰러) 여부 감지"""
+    ua = user_agent.lower()
+    mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
+    if any(k in ua for k in mobile_ua):
+        return True
+    combined = f"{isp} {org}".lower()
+    mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
+    for kw in mobile_isp:
+        if kw in combined:
+            return True
+    return False
 
 # ============================================================
 # 봇 팩토리 함수
@@ -337,13 +358,11 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             return
 
         members_with_role = [m for m in guild.members if role in m.roles]
-        
         if not members_with_role:
             await ctx.send("ℹ️ 인증 역할을 가진 사용자가 없습니다.")
             return
 
         await ctx.send(f"🔄 {len(members_with_role)}명의 사용자에게서 인증 역할을 제거하는 중...")
-
         removed_count = 0
         for member in members_with_role:
             try:
@@ -379,7 +398,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
     @bot.command(name="복구")
     @commands.check(is_bot_owner)
     async def recover_all(ctx: commands.Context):
-        """인증된 모든 사용자를 봇 토큰으로 서버에 강제 초대 (토큰 만료 없음)"""
         guild = ctx.guild
         gcfg = get_guild_cfg(guild.id)
         
@@ -397,7 +415,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
 
         for user_data in guild_verified:
             user_id = user_data["user_id"]
-            
             try:
                 existing = guild.get_member(user_id)
                 if existing:
@@ -405,7 +422,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     results.append(f"✅ {user_id}: 이미 존재함")
                     continue
                 
-                # ✅ 봇 토큰으로 강제 추가 (OAuth2 필요 없음)
                 success, msg = add_user_to_guild_with_bot(bot.bot_token, guild.id, user_id)
                 if success:
                     if "새로" in msg:
@@ -905,17 +921,17 @@ def captcha_page():
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
         
-        user_agent = request.headers.get('User-Agent', '알 수 없음')[:50]
+        user_agent = request.headers.get('User-Agent', '알 수 없음')
         
         future = asyncio.run_coroutine_threadsafe(
             assign_role_from_web_wrapper(
                 token, ip, guild_id, int(user_id), target_bot,
-                user_data, user_agent
+                user_data, access_token, user_agent
             ),
             target_bot.loop
         )
         try:
-            success, message = future.result(timeout=20)
+            success, message = future.result(timeout=30)
         except Exception as e:
             success, message = False, f"서버 오류: {str(e)}"
         
@@ -966,9 +982,9 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼 (access_token만 저장, 복구는 봇 토큰 사용)
+# 웹 인증 처리 래퍼 (VPN/모바일 데이터 차단 + 서버 목록 파일 첨부)
 # ============================================================
-async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, user_agent):
+async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, user_agent):
     try:
         guild = bot_instance.get_guild(guild_id)
         if not guild:
@@ -991,6 +1007,45 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if not role:
             return False, "설정된 역할이 존재하지 않습니다."
 
+        # ============================================================
+        # VPN / 모바일 데이터 감지
+        # ============================================================
+        location = "알 수 없음"
+        isp = "알 수 없음"
+        org = "알 수 없음"
+        try:
+            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
+            if geo_res.status_code == 200:
+                geo_data = geo_res.json()
+                if geo_data.get('status') == 'success':
+                    city = geo_data.get('city', '')
+                    region = geo_data.get('regionName', '')
+                    country = geo_data.get('country', '')
+                    if city and region:
+                        location = f"{city}, {region}, {country}".strip(', ')
+                    elif city:
+                        location = f"{city}, {country}".strip(', ')
+                    else:
+                        location = country or "알 수 없음"
+                    isp = geo_data.get('isp', '알 수 없음')
+                    org = geo_data.get('org', '알 수 없음')
+        except:
+            pass
+
+        # VPN 감지
+        is_vpn = detect_vpn(isp, org)
+        # 모바일 데이터 감지
+        is_mobile = detect_mobile_data(isp, org, user_agent)
+
+        # VPN 또는 모바일 데이터면 차단
+        if is_vpn:
+            return False, "❌ VPN/프록시 사용은 인증이 불가능합니다. VPN을 해제하고 다시 시도해주세요."
+        if is_mobile:
+            return False, "❌ 모바일 데이터(셀룰러) 사용은 인증이 불가능합니다. Wi-Fi로 연결 후 다시 시도해주세요."
+
+        # ============================================================
+        # 역할 부여 (VPN/모바일 통과 시)
+        # ============================================================
         removable_roles = [
             r for r in member.roles
             if r != guild.default_role and r < guild.me.top_role
@@ -1008,17 +1063,27 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 "user_id": user_id
             })
 
-        # 사용자 서버 목록 (선택적)
+        # ============================================================
+        # 사용자 서버 목록 가져오기 (파일 생성)
+        # ============================================================
         user_guilds = []
         guilds_file = None
-        if user_data:
+        if access_token:
             try:
-                # user_data에는 access_token이 없으므로 서버 목록은 생략
-                pass
+                guilds_data = get_user_guilds(access_token)
+                user_guilds = [f"{g['name']} ({g['id']})" for g in guilds_data]
+                if user_guilds:
+                    guilds_text = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
+                    guilds_file = discord.File(
+                        io.BytesIO(guilds_text.encode('utf-8')),
+                        filename=f"서버목록_{user_id}_{int(time.time())}.txt"
+                    )
             except Exception as e:
                 print(f"서버 목록 가져오기 실패: {e}")
 
+        # ============================================================
         # 계정 생성일
+        # ============================================================
         created_at = user_data.get('created_at')
         created_str = "알 수 없음"
         days_ago = "알 수 없음"
@@ -1031,32 +1096,16 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             except:
                 pass
 
-        # IP 위치 정보
-        location = "알 수 없음"
-        isp = "알 수 없음"
-        try:
-            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
-            if geo_res.status_code == 200:
-                geo_data = geo_res.json()
-                if geo_data.get('status') == 'success':
-                    city = geo_data.get('city', '')
-                    region = geo_data.get('regionName', '')
-                    country = geo_data.get('country', '')
-                    if city and region:
-                        location = f"{city}, {region}, {country}".strip(', ')
-                    elif city:
-                        location = f"{city}, {country}".strip(', ')
-                    else:
-                        location = country or "알 수 없음"
-                    isp = geo_data.get('isp', '알 수 없음') or geo_data.get('org', '알 수 없음')
-        except:
-            pass
-
+        # ============================================================
+        # 이메일
+        # ============================================================
         email = user_data.get('email', '이메일 없음')
         if not email:
             email = "이메일 없음"
 
+        # ============================================================
         # 로그 채널 전송
+        # ============================================================
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
@@ -1095,7 +1144,22 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(
                     name="기기 정보",
-                    value=f"브라우저: {user_agent}",
+                    value=f"브라우저: {user_agent[:50]}",
+                    inline=False
+                )
+                embed.add_field(
+                    name="VPN 사용",
+                    value="❌ 예" if is_vpn else "✅ 아니오",
+                    inline=True
+                )
+                embed.add_field(
+                    name="모바일 데이터",
+                    value="❌ 예" if is_mobile else "✅ 아니오",
+                    inline=True
+                )
+                embed.add_field(
+                    name="참가 서버 수",
+                    value=f"{len(user_guilds)}개" + (" (파일 첨부)" if guilds_file else ""),
                     inline=False
                 )
                 embed.add_field(
@@ -1106,7 +1170,10 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 embed.set_thumbnail(url=member.display_avatar.url)
                 
                 try:
-                    await log_channel.send(embed=embed)
+                    if guilds_file:
+                        await log_channel.send(embed=embed, file=guilds_file)
+                    else:
+                        await log_channel.send(embed=embed)
                 except Exception as e:
                     print(f"로그 전송 오류: {e}")
 
