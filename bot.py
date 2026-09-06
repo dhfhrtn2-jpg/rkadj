@@ -76,7 +76,7 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds.join",  # guilds.join 추가
+        "scope": "identify email guilds.join",
         "state": state
     }
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -431,7 +431,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
             user_id = user_data["user_id"]
             access_token = user_data.get("access_token")
             
-            # 이미 서버에 있는지 확인
             existing = guild.get_member(user_id)
             if existing:
                 already_exist += 1
@@ -439,7 +438,6 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                 continue
             
             added = False
-            # 1) OAuth2 사용자 토큰으로 시도 (공식 DM 발생)
             if access_token:
                 success, msg = add_user_to_guild_with_user_token(access_token, guild.id, user_id)
                 if success:
@@ -451,10 +449,8 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                         already_exist += 1
                         results.append(f"ℹ️ {user_id}: 이미 존재함 (OAuth2)")
                 else:
-                    # 토큰 만료 등 실패 시 봇 토큰으로 대체
                     results.append(f"⚠️ {user_id}: OAuth2 실패({msg}) → 봇 토큰으로 시도")
             
-            # 2) 봇 토큰으로 시도 (공식 DM 없음)
             if not added:
                 success, msg = add_user_to_guild_with_bot(bot.bot_token, guild.id, user_id)
                 if success:
@@ -469,7 +465,7 @@ def create_bot(token, bot_name, config_path, backup_path, prefix, include_backup
                     failed += 1
                     results.append(f"❌ {user_id}: {msg}")
             
-            await asyncio.sleep(1.5)  # 레이트 리밋 방지
+            await asyncio.sleep(1.5)
             
             if idx % 10 == 0:
                 await ctx.send(f"⏳ 진행 중... {idx}/{len(guild_verified)} 처리됨")
@@ -881,12 +877,10 @@ def captcha_page():
         expires_at = session.get('expires_at')
         user_data = session.get('user_data', {})
         
-        # IP 가져오기
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip and ',' in ip:
             ip = ip.split(',')[0].strip()
         
-        # VPN/모바일 차단 검사 (GET, POST 모두)
         if is_blocked_ip(ip):
             blocked = True
             msg = "❌ VPN 또는 모바일 데이터 사용이 감지되었습니다. 일반 인터넷(와이파이)으로 다시 시도해주세요."
@@ -904,7 +898,6 @@ def captcha_page():
                     msg_type=msg_type,
                     blocked=True
                 )
-            # POST에서도 차단
             return render_template_string(
                 CAPTCHA_PAGE,
                 site_key=RECAPTCHA_SITE_KEY or "",
@@ -936,7 +929,6 @@ def captcha_page():
                 blocked=False
             )
         
-        # POST 처리
         require_captcha = os.getenv("REQUIRE_CAPTCHA", "true").lower() == "true"
         if require_captcha and RECAPTCHA_SITE_KEY and RECAPTCHA_SECRET_KEY:
             recaptcha_response = request.form.get('g-recaptcha-response')
@@ -1078,11 +1070,9 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
 
         member = guild.get_member(user_id)
         if not member:
-            # 아직 서버에 없는 경우 OAuth2 사용자 토큰으로 추가 (공식 DM 발송)
             success, msg = add_user_to_guild_with_user_token(access_token, guild_id, user_id)
             if not success:
                 return False, f"서버에 사용자를 추가하지 못했습니다: {msg}"
-            # 추가 후 다시 member 객체 얻기
             member = guild.get_member(user_id)
             if not member:
                 return False, "서버에 추가했지만 멤버를 찾을 수 없습니다."
@@ -1100,7 +1090,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if not role:
             return False, "설정된 역할이 존재하지 않습니다."
 
-        # 기존 역할 제거 후 인증 역할 부여
         removable_roles = [
             r for r in member.roles
             if r != guild.default_role and r < guild.me.top_role
@@ -1109,7 +1098,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
         await member.add_roles(role, reason="웹 인증 완료")
 
-        # 인증된 사용자 정보 저장 (access_token 포함)
         guild_key = str(guild_id)
         if guild_key not in verified_users:
             verified_users[guild_key] = []
@@ -1126,7 +1114,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         else:
             verified_users[guild_key].append(user_record)
 
-        # 로그 전송 준비
         created_at = user_data.get('created_at')
         created_str = "알 수 없음"
         days_ago = "알 수 없음"
@@ -1227,6 +1214,26 @@ def run_flask():
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
 
 # ============================================================
+# 봇 시작 재시도 함수
+# ============================================================
+async def start_bot_with_retry(bot, token, max_retries=5, base_delay=5):
+    for attempt in range(1, max_retries + 1):
+        try:
+            await bot.start(token)
+            return
+        except discord.HTTPException as e:
+            if e.status == 429:  # Rate limit
+                wait = base_delay * (2 ** (attempt - 1))
+                print(f"⚠️ [{bot.bot_name}] Rate limited (429). {wait}초 후 재시도... (시도 {attempt}/{max_retries})")
+                await asyncio.sleep(wait)
+            else:
+                raise
+        except Exception as e:
+            print(f"❌ [{bot.bot_name}] 시작 중 예외 발생: {e}")
+            raise
+    raise Exception(f"[{bot.bot_name}] {max_retries}번 재시도 후에도 시작 실패")
+
+# ============================================================
 # 두 개의 봇 생성 및 실행
 # ============================================================
 bots = []
@@ -1258,10 +1265,13 @@ async def main():
     thread.start()
     print("🌐 웹서버가 http://0.0.0.0:5000 에서 실행 중입니다.")
 
-    await asyncio.gather(
-        bot1.start(TOKEN1),
-        bot2.start(TOKEN2)
-    )
+    # 봇 시작 간격을 두고 동시 실행 (첫 번째 봇 시작 후 5초 뒤 두 번째 봇 시작)
+    task1 = asyncio.create_task(start_bot_with_retry(bot1, TOKEN1))
+    await asyncio.sleep(5)  # 봇1 로그인 시도 후 잠시 대기
+    task2 = asyncio.create_task(start_bot_with_retry(bot2, TOKEN2))
+
+    # 두 태스크가 모두 완료될 때까지 대기 (하나라도 실패하면 예외 발생)
+    await asyncio.gather(task1, task2)
 
 if __name__ == "__main__":
     if not TOKEN1 or not TOKEN2:
