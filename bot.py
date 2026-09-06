@@ -1186,4 +1186,4 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
 # Flask 서버 실행
 # ============================================================'''
 def run_flask():
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False
+    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
