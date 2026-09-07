@@ -118,17 +118,18 @@ def detect_vpn(isp: str, org: str) -> bool:
             return True
     return False
 
-def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
-    ua = user_agent.lower()
-    mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
-    if any(k in ua for k in mobile_ua):
-        return True
-    combined = f"{isp} {org}".lower()
-    mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
-    for kw in mobile_isp:
-        if kw in combined:
-            return True
-    return False
+# 기존 detect_mobile_data는 더 이상 사용하지 않음 (주석 처리)
+# def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
+#     ua = user_agent.lower()
+#     mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
+#     if any(k in ua for k in mobile_ua):
+#         return True
+#     combined = f"{isp} {org}".lower()
+#     mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
+#     for kw in mobile_isp:
+#         if kw in combined:
+#             return True
+#     return False
 
 # ============================================================
 # 봇 클라이언트
@@ -891,14 +892,17 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         location = "알 수 없음"
         isp = "알 수 없음"
         org = "알 수 없음"
+        is_mobile_data = False
+        country = "알 수 없음"
         try:
-            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
+            # ip-api.com에 mobile 필드 추가 요청
+            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName,mobile", timeout=5)
             if geo_res.status_code == 200:
                 geo_data = geo_res.json()
                 if geo_data.get('status') == 'success':
                     city = geo_data.get('city', '')
                     region = geo_data.get('regionName', '')
-                    country = geo_data.get('country', '')
+                    country = geo_data.get('country', '알 수 없음')
                     if city and region:
                         location = f"{city}, {region}, {country}".strip(', ')
                     elif city:
@@ -907,16 +911,25 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                         location = country or "알 수 없음"
                     isp = geo_data.get('isp', '알 수 없음')
                     org = geo_data.get('org', '알 수 없음')
+                    is_mobile_data = geo_data.get('mobile', False)
         except:
             pass
 
         is_vpn = detect_vpn(isp, org)
-        is_mobile = detect_mobile_data(isp, org, user_agent)
 
+        # 1. VPN/프록시 차단
         if is_vpn:
             return False, "❌ VPN/프록시 사용은 인증이 불가능합니다. VPN을 해제하고 다시 시도해주세요."
-        if is_mobile:
+
+        # 2. 국가 체크 (대한민국이 아니면 차단)
+        if country not in ["South Korea", "KR", "Korea"]:
+            return False, "❌ 해외에서의 인증은 불가능합니다. 대한민국 내에서 시도해주세요."
+
+        # 3. 모바일 데이터 차단 (ip-api의 mobile 필드가 true이면 셀룰러 연결로 간주)
+        if is_mobile_data:
             return False, "❌ 모바일 데이터(셀룰러) 사용은 인증이 불가능합니다. Wi-Fi로 연결 후 다시 시도해주세요."
+
+        # (모바일 기기라도 Wi-Fi 연결이면 mobile=false이므로 통과)
 
         # 역할 부여
         removable_roles = [
@@ -927,7 +940,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
         await member.add_roles(role, reason="웹 인증 완료")
 
-        # 인증된 사용자 저장 (복구용은 아니지만 기록용)
+        # 인증된 사용자 저장 (기록용)
         guild_key = str(guild_id)
         if guild_key not in verified_users:
             verified_users[guild_key] = []
@@ -994,7 +1007,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(name="기기 정보", value=f"브라우저: {user_agent[:50]}", inline=False)
                 embed.add_field(name="VPN 사용", value="❌ 예" if is_vpn else "✅ 아니오", inline=True)
-                embed.add_field(name="모바일 데이터", value="❌ 예" if is_mobile else "✅ 아니오", inline=True)
+                embed.add_field(name="모바일 데이터", value="❌ 예" if is_mobile_data else "✅ 아니오", inline=True)
                 embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개" + (" (파일 첨부)" if guilds_file else ""), inline=False)
                 embed.set_thumbnail(url=member.display_avatar.url)
                 
