@@ -13,9 +13,8 @@ import re
 import aiohttp
 import urllib.parse
 import io
-import socket
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
+from flask import Flask, request, render_template_string, redirect, session, url_for
 
 # ============================================================
 # 공통 설정 (환경변수)
@@ -115,6 +114,18 @@ def detect_vpn(isp: str, org: str) -> bool:
     combined = f"{isp} {org}".lower()
     keywords = ["vpn", "proxy", "hosting", "cloud", "aws", "amazon", "digitalocean", "linode", "vultr", "heroku", "ovh", "azure", "gcp", "google cloud", "alibaba", "tencent", "cloudflare", "tor", "anonymizer"]
     for kw in keywords:
+        if kw in combined:
+            return True
+    return False
+
+def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
+    ua = user_agent.lower()
+    mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
+    if any(k in ua for k in mobile_ua):
+        return True
+    combined = f"{isp} {org}".lower()
+    mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
+    for kw in mobile_isp:
         if kw in combined:
             return True
     return False
@@ -430,11 +441,11 @@ class ConsoleView(discord.ui.View):
                 color=discord.Color.blue()
             )
             embed.add_field(
-                name="^ 위에 하이퍼 링크를 눌러 인증을 완료하세요",
-                value="ㅤ\nㅤ",
+                name="📋 필요 권한",
+                value="• 이메일 보기\n• 기본 정보 확인",
                 inline=False
             )
-            embed.set_footer(text="봇이 아님을 인증하면 역할이 지급됩니다.")
+            embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
             await interaction.followup.send(embed=embed, ephemeral=True)
 
         except Exception as e:
@@ -783,7 +794,8 @@ def captcha_page():
                 msg_type="error"
             )
         
-        target_bot = bot
+        # 현재 봇이 그 서버에 있는지 확인 (복구봇 제거로 단일 봇)
+        target_bot = bot  # 단일 봇
         
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
         if ip and ',' in ip:
@@ -875,19 +887,18 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if not role:
             return False, "설정된 역할이 존재하지 않습니다."
 
+        # VPN / 모바일 데이터 감지
         location = "알 수 없음"
         isp = "알 수 없음"
         org = "알 수 없음"
-        is_mobile_data = False
-        country = "알 수 없음"
         try:
-            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName,mobile", timeout=5)
+            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
             if geo_res.status_code == 200:
                 geo_data = geo_res.json()
                 if geo_data.get('status') == 'success':
                     city = geo_data.get('city', '')
                     region = geo_data.get('regionName', '')
-                    country = geo_data.get('country', '알 수 없음')
+                    country = geo_data.get('country', '')
                     if city and region:
                         location = f"{city}, {region}, {country}".strip(', ')
                     elif city:
@@ -896,21 +907,18 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                         location = country or "알 수 없음"
                     isp = geo_data.get('isp', '알 수 없음')
                     org = geo_data.get('org', '알 수 없음')
-                    is_mobile_data = geo_data.get('mobile', False)
         except:
             pass
 
         is_vpn = detect_vpn(isp, org)
+        is_mobile = detect_mobile_data(isp, org, user_agent)
 
         if is_vpn:
             return False, "❌ VPN/프록시 사용은 인증이 불가능합니다. VPN을 해제하고 다시 시도해주세요."
-
-        if country not in ["South Korea", "KR", "Korea"]:
-            return False, "❌ 해외에서의 인증은 불가능합니다. 대한민국 내에서 시도해주세요."
-
-        if is_mobile_data:
+        if is_mobile:
             return False, "❌ 모바일 데이터(셀룰러) 사용은 인증이 불가능합니다. Wi-Fi로 연결 후 다시 시도해주세요."
 
+        # 역할 부여
         removable_roles = [
             r for r in member.roles
             if r != guild.default_role and r < guild.me.top_role
@@ -919,12 +927,14 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
         await member.add_roles(role, reason="웹 인증 완료")
 
+        # 인증된 사용자 저장 (복구용은 아니지만 기록용)
         guild_key = str(guild_id)
         if guild_key not in verified_users:
             verified_users[guild_key] = []
         if user_id not in [u["user_id"] for u in verified_users[guild_key]]:
             verified_users[guild_key].append({"user_id": user_id})
 
+        # 서버 목록 파일 생성
         user_guilds = []
         guilds_file = None
         if access_token:
@@ -940,6 +950,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             except Exception as e:
                 print(f"서버 목록 가져오기 실패: {e}")
 
+        # 계정 생성일
         created_at = user_data.get('created_at')
         created_str = "알 수 없음"
         days_ago = "알 수 없음"
@@ -956,6 +967,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if not email:
             email = "이메일 없음"
 
+        # 로그 전송
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
@@ -982,7 +994,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 )
                 embed.add_field(name="기기 정보", value=f"브라우저: {user_agent[:50]}", inline=False)
                 embed.add_field(name="VPN 사용", value="❌ 예" if is_vpn else "✅ 아니오", inline=True)
-                embed.add_field(name="모바일 데이터", value="❌ 예" if is_mobile_data else "✅ 아니오", inline=True)
+                embed.add_field(name="모바일 데이터", value="❌ 예" if is_mobile else "✅ 아니오", inline=True)
                 embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개" + (" (파일 첨부)" if guilds_file else ""), inline=False)
                 embed.set_thumbnail(url=member.display_avatar.url)
                 
@@ -1001,298 +1013,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         return False, f"오류 발생: {str(e)}"
 
 # ============================================================
-# 🆕 PC 원격 전원 (Power) 기능
-# ============================================================
-POWER_PASSWORD = os.getenv("POWER_PASSWORD", "6254")
-AGENT_TOKEN = os.getenv("AGENT_TOKEN", "change-this-agent-token")
-WOL_TARGET = os.getenv("WOL_TARGET", "")
-WOL_MAC = os.getenv("WOL_MAC", "")
-WOL_PORT = int(os.getenv("WOL_PORT", 9))
-REMOTE_DESKTOP_URL = os.getenv("REMOTE_DESKTOP_URL", "https://remotedesktop.google.com/access")
-
-shutdown_request = {
-    "requested": False,
-    "requested_at": None,
-}
-
-pc_status = {
-    "last_heartbeat": 0,
-    "hostname": None,
-    "os": None,
-}
-
-def send_magic_packet(mac_address, target, port=9):
-    mac_clean = mac_address.replace(":", "").replace("-", "").strip()
-    if len(mac_clean) != 12:
-        raise ValueError("MAC 주소 형식 오류")
-    mac_bytes = bytes.fromhex(mac_clean)
-    packet = b'\xff' * 6 + mac_bytes * 16
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    try:
-        sock.sendto(packet, (target, port))
-    finally:
-        sock.close()
-
-@app.route('/heartbeat', methods=['POST'])
-def heartbeat():
-    agent_token = request.headers.get('X-Agent-Token')
-    if agent_token != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    pc_status["last_heartbeat"] = time.time()
-    pc_status["hostname"] = data.get("hostname", "알 수 없음")
-    pc_status["os"] = data.get("os", "알 수 없음")
-    return jsonify({"ok": True})
-
-@app.route('/pc_status')
-def pc_status_route():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    elapsed = time.time() - pc_status["last_heartbeat"]
-    is_online = elapsed < 30
-    return jsonify({
-        "ok": True,
-        "online": is_online,
-        "hostname": pc_status["hostname"],
-        "os": pc_status["os"],
-        "last_seen_seconds": int(elapsed) if pc_status["last_heartbeat"] > 0 else None,
-    })
-
-@app.route('/check_shutdown', methods=['GET'])
-def check_shutdown():
-    agent_token = request.headers.get('X-Agent-Token')
-    if agent_token != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    if shutdown_request["requested"]:
-        shutdown_request["requested"] = False
-        return jsonify({
-            "ok": True,
-            "shutdown": True,
-            "requested_at": shutdown_request["requested_at"],
-        })
-    return jsonify({"ok": True, "shutdown": False})
-
-@app.route('/shutdown', methods=['POST'])
-def request_shutdown():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인이 필요합니다."}), 401
-    elapsed = time.time() - pc_status["last_heartbeat"]
-    if elapsed >= 30:
-        return jsonify({"ok": False, "error": "이미 꺼져있습니다."})
-    shutdown_request["requested"] = True
-    shutdown_request["requested_at"] = time.time()
-    return jsonify({"ok": True, "message": "종료 요청이 접수되었습니다."})
-
-@app.route('/wake', methods=['POST'])
-def wake_pc():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인이 필요합니다."}), 401
-    elapsed = time.time() - pc_status["last_heartbeat"]
-    if elapsed < 30:
-        return jsonify({"ok": False, "error": "이미 켜져있습니다."})
-    if not WOL_TARGET or not WOL_MAC:
-        return jsonify({"ok": False, "error": "WOL 설정이 되어있지 않습니다. (WOL_TARGET, WOL_MAC 환경변수 필요)"})
-    try:
-        send_magic_packet(WOL_MAC, WOL_TARGET, WOL_PORT)
-        return jsonify({"ok": True, "message": "매직 패킷 전송됨. 30초 후 상태를 확인하세요."})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-POWER_LOGIN_PAGE = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔐 로그인</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-    min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; color:#eee; }
-  .box { background:rgba(255,255,255,0.08); backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:40px 30px;
-    max-width:380px; width:100%; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
-  .box h1 { font-size:22px; margin-bottom:8px; font-weight:700; }
-  .box p { font-size:14px; color:#a0aec0; margin-bottom:28px; }
-  input { width:100%; padding:16px; font-size:22px; letter-spacing:8px; text-align:center;
-    background:rgba(0,0,0,0.3); border:2px solid rgba(255,255,255,0.15); border-radius:14px;
-    color:#fff; outline:none; margin-bottom:18px; }
-  input:focus { border-color:#667eea; }
-  button { width:100%; padding:15px; font-size:17px; font-weight:600;
-    background:linear-gradient(135deg,#667eea,#764ba2); color:white; border:none;
-    border-radius:14px; cursor:pointer; }
-  button:active { transform:scale(0.97); }
-  .error { color:#fc8181; font-size:14px; margin-top:14px; min-height:20px; }
-</style>
-</head>
-<body>
-  <div class="box">
-    <h1>🔐 PC 원격 전원</h1>
-    <p>비밀번호를 입력하세요</p>
-    <form method="POST" action="/power_login">
-      <input type="password" name="password" inputmode="numeric" maxlength="20" autofocus placeholder="••••">
-      <button type="submit">로그인</button>
-    </form>
-    <div class="error">{{ error }}</div>
-  </div>
-</body>
-</html>
-"""
-
-POWER_CONTROL_PAGE = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔌 PC 원격 전원</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-    min-height:100vh; display:flex; align-items:center; justify-content:center;
-    padding:20px; color:#eee; }
-  .box { background:rgba(255,255,255,0.08); backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:30px 24px;
-    max-width:420px; width:100%; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
-  .box h1 { font-size:22px; margin-bottom:6px; font-weight:700; }
-  .box p { font-size:13px; color:#a0aec0; margin-bottom:22px; }
-  .status { display:inline-block; padding:8px 16px; border-radius:20px; font-size:13px;
-    margin-bottom:22px; transition:all 0.3s; }
-  .status.online { background:rgba(72,187,120,0.15); color:#68d391; }
-  .status.offline { background:rgba(245,101,101,0.15); color:#fc8181; }
-  .status.loading { background:rgba(160,174,192,0.15); color:#a0aec0; }
-  button, a.btn {
-    width:100%; padding:22px; font-size:19px; font-weight:700;
-    border:none; border-radius:16px; cursor:pointer; display:block;
-    text-decoration:none; text-align:center; transition:transform 0.15s;
-    margin-bottom:14px;
-  }
-  button:active, a.btn:active { transform:scale(0.97); }
-  button:disabled { opacity:0.5; cursor:not-allowed; }
-  .btn-on { background:linear-gradient(135deg,#43a047,#2e7d32); color:#fff;
-    box-shadow:0 8px 24px rgba(67,160,71,0.35); }
-  .btn-off { background:linear-gradient(135deg,#e53935,#b71c1c); color:#fff;
-    box-shadow:0 8px 24px rgba(229,57,53,0.35); }
-  .btn-remote { background:linear-gradient(135deg,#1a73e8,#0d47a1); color:#fff;
-    box-shadow:0 8px 24px rgba(26,115,232,0.35); }
-  .btn-logout { padding:10px 16px; font-size:13px; font-weight:400;
-    background:rgba(255,255,255,0.08); color:#a0aec0; border:1px solid rgba(255,255,255,0.15);
-    border-radius:10px; margin-top:10px; width:auto; display:inline-block; }
-  #msg { margin-top:16px; font-size:14px; color:#a0aec0; min-height:20px; }
-</style>
-</head>
-<body>
-  <div class="box">
-    <div id="pcStatus" class="status loading">● 확인 중...</div>
-    <h1>PC 원격 전원</h1>
-    <p>컴퓨터를 켜거나 끌 수 있어요</p>
-
-    <button class="btn-on" id="btnWake" onclick="wakePC()">⏻ 컴퓨터 켜기</button>
-    <button class="btn-off" id="btnShutdown" onclick="sendShutdown()">🔌 컴퓨터 끄기</button>
-    <a class="btn btn-remote" href="{{ remote_url }}" target="_blank">🖥️ 원격 데스크톱 (가로 모드)</a>
-
-    <div id="msg"></div>
-    <button class="btn-logout" onclick="logout()">로그아웃</button>
-  </div>
-
-<script>
-let isOnline = false;
-
-async function updateStatus() {
-  const el = document.getElementById('pcStatus');
-  try {
-    const r = await fetch('/pc_status');
-    const d = await r.json();
-    if (!d.ok) { el.textContent = '● 세션 만료'; el.className = 'status offline'; return; }
-    isOnline = d.online;
-    if (d.online) {
-      el.textContent = '● 켜져있음 (' + (d.hostname || 'PC') + ')';
-      el.className = 'status online';
-      document.getElementById('btnShutdown').disabled = false;
-      document.getElementById('btnWake').disabled = true;
-    } else {
-      el.textContent = '● 꺼져있음';
-      el.className = 'status offline';
-      document.getElementById('btnShutdown').disabled = true;
-      document.getElementById('btnWake').disabled = false;
-    }
-  } catch (e) {
-    el.textContent = '● 상태 확인 실패';
-    el.className = 'status offline';
-  }
-}
-
-async function wakePC() {
-  if (isOnline) { document.getElementById('msg').textContent = '⚠️ 이미 켜져있습니다.'; return; }
-  if (!confirm('컴퓨터를 켜시겠습니까? (약 30초 소요)')) return;
-  document.getElementById('msg').textContent = '⏳ 매직 패킷 전송 중...';
-  try {
-    const r = await fetch('/wake', { method: 'POST' });
-    const d = await r.json();
-    document.getElementById('msg').textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
-    if (d.ok) setTimeout(updateStatus, 30000);
-  } catch (e) {
-    document.getElementById('msg').textContent = '❌ 네트워크 오류';
-  }
-}
-
-async function sendShutdown() {
-  if (!isOnline) { document.getElementById('msg').textContent = '❌ 이미 꺼져있습니다.'; return; }
-  if (!confirm('정말로 컴퓨터를 끄시겠습니까?')) return;
-  const btn = document.getElementById('btnShutdown');
-  btn.disabled = true;
-  btn.textContent = '⏳ 요청 중...';
-  try {
-    const r = await fetch('/shutdown', { method: 'POST' });
-    const d = await r.json();
-    document.getElementById('msg').textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
-    if (d.ok) { btn.textContent = '✅ 요청됨'; setTimeout(updateStatus, 15000); }
-    else { btn.disabled = false; btn.textContent = '🔌 컴퓨터 끄기'; }
-  } catch (e) {
-    document.getElementById('msg').textContent = '❌ 네트워크 오류';
-    btn.disabled = false;
-    btn.textContent = '🔌 컴퓨터 끄기';
-  }
-}
-
-async function logout() {
-  await fetch('/power_logout', { method: 'POST' });
-  location.reload();
-}
-
-updateStatus();
-setInterval(updateStatus, 5000);
-</script>
-</body>
-</html>
-"""
-
-@app.route('/power')
-def power_page():
-    if not session.get('power_logged_in'):
-        return render_template_string(POWER_LOGIN_PAGE, error="")
-    return render_template_string(POWER_CONTROL_PAGE, remote_url=REMOTE_DESKTOP_URL)
-
-@app.route('/power_login', methods=['POST'])
-def power_login():
-    pw = request.form.get('password', '')
-    if pw == POWER_PASSWORD:
-        session.permanent = True
-        session['power_logged_in'] = True
-        session['power_login_at'] = time.time()
-        return redirect(url_for('power_page'))
-    return render_template_string(POWER_LOGIN_PAGE, error="❌ 비밀번호가 틀렸습니다.")
-
-@app.route('/power_logout', methods=['POST'])
-def power_logout():
-    session.pop('power_logged_in', None)
-    session.pop('power_login_at', None)
-    return jsonify({"ok": True})
-
-# ============================================================
 # Flask 서버 실행
 # ============================================================
 def run_flask():
@@ -1305,7 +1025,9 @@ if __name__ == "__main__":
     if not TOKEN:
         print("❌ DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다!")
     else:
+        # Flask 스레드 시작
         thread = threading.Thread(target=run_flask, daemon=True)
         thread.start()
         print("🌐 웹서버가 http://0.0.0.0:5000 에서 실행 중입니다.")
+        # 봇 실행
         bot.run(TOKEN)
