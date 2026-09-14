@@ -540,146 +540,245 @@ POWER_CONTROL_PAGE = """
 <html lang="ko">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <title>🔌 PC 원격 제어</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; }
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; user-select: none; }
+  html, body { height:100%; overflow-x:hidden; }
   body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
     background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-    min-height:100vh; padding:16px; color:#eee; }
+    min-height:100vh; padding:12px; color:#eee; }
   .box { background:rgba(255,255,255,0.06); backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,0.1); border-radius:20px; padding:20px;
-    max-width:900px; margin:0 auto 16px; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
-  .box h1 { font-size:20px; margin-bottom:6px; font-weight:700; }
-  .box p { font-size:13px; color:#a0aec0; margin-bottom:16px; }
-  .status { display:inline-block; padding:8px 16px; border-radius:20px; font-size:13px;
-    margin-bottom:16px; transition:all 0.3s; }
+    border:1px solid rgba(255,255,255,0.1); border-radius:18px; padding:18px;
+    max-width:900px; margin:0 auto 12px; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
+  .box h1 { font-size:18px; margin-bottom:6px; font-weight:700; }
+  .box p { font-size:12px; color:#a0aec0; margin-bottom:14px; }
+  .status { display:inline-block; padding:6px 14px; border-radius:20px; font-size:12px;
+    margin-bottom:14px; transition:all 0.3s; }
   .status.online { background:rgba(72,187,120,0.15); color:#68d391; }
   .status.offline { background:rgba(245,101,101,0.15); color:#fc8181; }
   .status.loading { background:rgba(160,174,192,0.15); color:#a0aec0; }
-  .btn-row { display:flex; gap:10px; margin-bottom:14px; }
-  button, a.btn { flex:1; padding:16px; font-size:15px; font-weight:700;
-    border:none; border-radius:14px; cursor:pointer; text-decoration:none;
-    text-align:center; transition:transform 0.15s; }
-  button:active, a.btn:active { transform:scale(0.97); }
-  button:disabled { opacity:0.4; cursor:not-allowed; }
-  .btn-on { background:linear-gradient(135deg,#43a047,#2e7d32); color:#fff; }
-  .btn-off { background:linear-gradient(135deg,#e53935,#b71c1c); color:#fff; }
-  .btn-gray { background:rgba(255,255,255,0.08); color:#a0aec0; border:1px solid rgba(255,255,255,0.15);
-    font-weight:400; font-size:13px; padding:10px; flex:0 0 auto; }
-  #msg { margin-top:12px; font-size:13px; color:#a0aec0; min-height:18px; }
-  .desktop-box { background:#000; border-radius:14px; overflow:hidden; margin-bottom:12px;
-    position:relative; touch-action: none; }
-  #screenImg { width:100%; display:block; cursor:crosshair; }
-  .desktop-overlay { position:absolute; top:8px; left:8px;
-    background:rgba(0,0,0,0.6); color:#68d391; font-size:11px;
-    padding:4px 10px; border-radius:20px; }
+
+  .toggle-btn {
+    width:100%; padding:28px 20px; font-size:20px; font-weight:700;
+    color:#fff; border:none; border-radius:18px; cursor:pointer;
+    transition:transform 0.15s, box-shadow 0.3s, background 0.3s;
+    display:flex; flex-direction:column; align-items:center; gap:6px;
+    margin-bottom:12px;
+  }
+  .toggle-btn:active { transform:scale(0.97); }
+  .toggle-btn:disabled { opacity:0.6; cursor:not-allowed; }
+  .toggle-btn.off-state { background:linear-gradient(135deg,#43a047,#2e7d32);
+    box-shadow:0 8px 24px rgba(67,160,71,0.4); }
+  .toggle-btn.on-state { background:linear-gradient(135deg,#e53935,#b71c1c);
+    box-shadow:0 8px 24px rgba(229,57,53,0.4); }
+  .toggle-btn.loading-state { background:rgba(255,255,255,0.1); box-shadow:none; }
+  .toggle-btn .icon { font-size:38px; }
+  .toggle-btn .text { font-size:16px; }
+
+  .msg { margin-top:10px; font-size:12px; color:#a0aec0; min-height:16px; }
+  .btn-gray { padding:8px 18px; font-size:12px; font-weight:400;
+    background:rgba(255,255,255,0.08); color:#a0aec0;
+    border:1px solid rgba(255,255,255,0.15); border-radius:10px;
+    cursor:pointer; margin-top:10px; }
+
+  #desktopSection { position:relative; }
+  .desktop-box { background:#000; border-radius:14px; overflow:hidden; margin-bottom:10px;
+    position:relative; touch-action:none; display:block; }
+  #screenImg { width:100%; display:block; cursor:crosshair; touch-action:none;
+    -webkit-user-drag:none; pointer-events:auto; }
+  .desktop-overlay { position:absolute; top:6px; left:6px;
+    background:rgba(0,0,0,0.65); color:#68d391; font-size:10px;
+    padding:3px 9px; border-radius:20px; pointer-events:none; z-index:5; }
+  .fs-overlay-btns { position:absolute; top:6px; right:6px; display:flex; gap:6px; z-index:6; }
+  .fs-btn { background:rgba(0,0,0,0.65); color:#fff; font-size:11px;
+    padding:6px 12px; border-radius:20px; border:none; cursor:pointer; }
+
   .keyboard-area { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
-  .keyboard-area input { flex:1; min-width:120px; padding:12px; font-size:14px;
-    background:rgba(0,0,0,0.3); border:2px solid rgba(255,255,255,0.15);
-    border-radius:10px; color:#fff; outline:none; }
+  .keyboard-area input { flex:1; min-width:100px; padding:11px;
+    font-size:14px; background:rgba(0,0,0,0.3);
+    border:2px solid rgba(255,255,255,0.15); border-radius:10px;
+    color:#fff; outline:none; user-select:text; -webkit-user-select:text; }
   .keyboard-area input:focus { border-color:#667eea; }
-  .keyboard-area button { flex:0 0 auto; padding:12px 18px; font-size:14px; }
-  .special-keys { display:flex; gap:6px; flex-wrap:wrap; }
-  .special-keys button { flex:1; padding:10px; font-size:12px; font-weight:500;
+  .keyboard-area button { flex:0 0 auto; padding:11px 16px; font-size:13px;
+    background:linear-gradient(135deg,#43a047,#2e7d32); color:#fff;
+    border:none; border-radius:10px; cursor:pointer; font-weight:600; }
+  .special-keys { display:grid; grid-template-columns:repeat(4, 1fr); gap:6px; }
+  .special-keys button { padding:10px 6px; font-size:11px; font-weight:500;
     background:rgba(255,255,255,0.08); color:#cbd5e0;
-    border:1px solid rgba(255,255,255,0.15); border-radius:8px; }
+    border:1px solid rgba(255,255,255,0.15); border-radius:8px; cursor:pointer; }
+  .special-keys button:active { background:rgba(255,255,255,0.2); }
+
+  #desktopSection:fullscreen {
+    padding:0; margin:0; border-radius:0; background:#000;
+    display:flex; flex-direction:column; width:100vw; height:100vh; max-width:none;
+  }
+  #desktopSection:fullscreen .desktop-box { flex:1; margin:0; border-radius:0; overflow:hidden; }
+  #desktopSection:fullscreen #screenImg { width:100%; height:100%; object-fit:contain; }
+  #desktopSection:fullscreen .kb-wrap { padding:6px; background:#111; }
+  #desktopSection:fullscreen .keyboard-area input { padding:8px; font-size:13px; }
+  #desktopSection:fullscreen .keyboard-area button { padding:8px 14px; font-size:12px; }
+  #desktopSection:fullscreen .special-keys button { padding:7px 4px; font-size:10px; }
+  #desktopSection:fullscreen .fs-hint { display:none; }
+
+  .fs-hint { font-size:11px; color:#a0aec0; margin-bottom:8px; }
 </style>
 </head>
 <body>
   <div class="box">
     <div id="pcStatus" class="status loading">● 확인 중...</div>
     <h1>🔌 PC 원격 제어</h1>
-    <p>컴퓨터 전원을 켜거나 끌 수 있어요</p>
-    <div class="btn-row">
-      <button class="btn-on" id="btnWake" onclick="wakePC()">⏻ 켜기</button>
-      <button class="btn-off" id="btnShutdown" onclick="sendShutdown()">🔌 끄기</button>
-    </div>
-    <div id="msg"></div>
-    <button class="btn-gray" onclick="logout()" style="margin-top:10px;">로그아웃</button>
+    <p>버튼 하나로 켜고 끌 수 있어요</p>
+    <button id="toggleBtn" class="toggle-btn loading-state" onclick="togglePower()" disabled>
+      <span class="icon" id="toggleIcon">⏳</span>
+      <span class="text" id="toggleText">확인 중...</span>
+    </button>
+    <div class="msg" id="msg"></div>
+    <button class="btn-gray" onclick="logout()">로그아웃</button>
   </div>
 
-  <div class="box">
-    <h1>🖥️ 원격 데스크톱</h1>
-    <p>화면을 터치하면 그 위치를 클릭합니다</p>
-    <div class="desktop-box">
+  <div class="box" id="desktopSection">
+    <h1 class="fs-hint">🖥️ 원격 데스크톱</h1>
+    <p class="fs-hint">탭 = 클릭 / 드래그 = 커서 이동 / 전체화면 버튼 = 가로 모드</p>
+
+    <div class="desktop-box" id="desktopFrame">
       <div class="desktop-overlay" id="desktopOverlay">● 연결 대기</div>
+      <div class="fs-overlay-btns">
+        <button class="fs-btn" onclick="toggleFullscreen()">⛶ 전체화면</button>
+      </div>
       <img id="screenImg" alt="화면" draggable="false">
     </div>
-    <div class="keyboard-area">
-      <input type="text" id="textInput" placeholder="텍스트 입력 후 전송"
-             onkeydown="if(event.key==='Enter'){sendText();event.preventDefault();}">
-      <button class="btn-on" onclick="sendText()" style="flex:0 0 auto;">입력</button>
-    </div>
-    <div class="special-keys">
-      <button onclick="sendKey('enter')">⏎ Enter</button>
-      <button onclick="sendKey('backspace')">⌫ Back</button>
-      <button onclick="sendKey('tab')">⇥ Tab</button>
-      <button onclick="sendKey('esc')">⎋ Esc</button>
-      <button onclick="sendKey('up')">↑</button>
-      <button onclick="sendKey('down')">↓</button>
-      <button onclick="sendKey('left')">←</button>
-      <button onclick="sendKey('right')">→</button>
-      <button onclick="sendHotkey(['ctrl','c'])">Ctrl+C</button>
-      <button onclick="sendHotkey(['ctrl','v'])">Ctrl+V</button>
-      <button onclick="sendHotkey(['ctrl','a'])">Ctrl+A</button>
-      <button onclick="sendHotkey(['alt','f4'])">Alt+F4</button>
+
+    <div class="kb-wrap">
+      <div class="keyboard-area">
+        <input type="text" id="textInput" placeholder="텍스트 입력 후 전송"
+               onkeydown="if(event.key==='Enter'){sendText();event.preventDefault();}">
+        <button onclick="sendText()">입력</button>
+      </div>
+      <div class="special-keys">
+        <button onclick="sendKey('enter')">⏎ Enter</button>
+        <button onclick="sendKey('backspace')">⌫ Back</button>
+        <button onclick="sendKey('tab')">⇥ Tab</button>
+        <button onclick="sendKey('esc')">⎋ Esc</button>
+        <button onclick="sendKey('up')">↑ Up</button>
+        <button onclick="sendKey('down')">↓ Down</button>
+        <button onclick="sendKey('left')">← Left</button>
+        <button onclick="sendKey('right')">→ Right</button>
+        <button onclick="sendHotkey(['ctrl','c'])">Ctrl+C</button>
+        <button onclick="sendHotkey(['ctrl','v'])">Ctrl+V</button>
+        <button onclick="sendHotkey(['ctrl','a'])">Ctrl+A</button>
+        <button onclick="sendHotkey(['ctrl','z'])">Ctrl+Z</button>
+        <button onclick="sendHotkey(['alt','f4'])">Alt+F4</button>
+        <button onclick="sendHotkey(['alt','tab'])">Alt+Tab</button>
+        <button onclick="sendHotkey(['win','d'])">Win+D</button>
+        <button onclick="sendHotkey(['ctrl','shift','esc'])">작업관리자</button>
+      </div>
     </div>
   </div>
 
 <script>
 let isOnline = false;
+let isBusy = false;
 let screenW = 1920, screenH = 1080;
 
 async function updateStatus() {
   const el = document.getElementById('pcStatus');
+  const btn = document.getElementById('toggleBtn');
+  const icon = document.getElementById('toggleIcon');
+  const text = document.getElementById('toggleText');
   try {
     const r = await fetch('/pc_status');
     const d = await r.json();
     if (!d.ok) { el.textContent = '● 세션 만료'; el.className = 'status offline'; return; }
     isOnline = d.online;
+    if (isBusy) return;
     if (d.online) {
       el.textContent = '● 켜져있음 (' + (d.hostname || 'PC') + ')';
       el.className = 'status online';
-      document.getElementById('btnShutdown').disabled = false;
-      document.getElementById('btnWake').disabled = true;
+      btn.className = 'toggle-btn on-state';
+      btn.disabled = false;
+      icon.textContent = '🔌';
+      text.textContent = '컴퓨터 끄기';
       screenW = d.screen_width || 1920;
       screenH = d.screen_height || 1080;
     } else {
       el.textContent = '● 꺼져있음';
       el.className = 'status offline';
-      document.getElementById('btnShutdown').disabled = true;
-      document.getElementById('btnWake').disabled = false;
+      btn.className = 'toggle-btn off-state';
+      btn.disabled = false;
+      icon.textContent = '⏻';
+      text.textContent = '컴퓨터 켜기';
     }
   } catch (e) { el.textContent = '● 상태 확인 실패'; el.className = 'status offline'; }
 }
 
-async function wakePC() {
-  if (isOnline) { document.getElementById('msg').textContent = '⚠️ 이미 켜져있습니다.'; return; }
-  if (!confirm('컴퓨터를 켜시겠습니까? (약 30초 소요)')) return;
-  document.getElementById('msg').textContent = '⏳ 매직 패킷 전송 중...';
-  try {
-    const r = await fetch('/wake', { method: 'POST' });
-    const d = await r.json();
-    document.getElementById('msg').textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
-    if (d.ok) setTimeout(updateStatus, 30000);
-  } catch (e) { document.getElementById('msg').textContent = '❌ 네트워크 오류'; }
+async function togglePower() {
+  if (isBusy) return;
+  const btn = document.getElementById('toggleBtn');
+  const icon = document.getElementById('toggleIcon');
+  const text = document.getElementById('toggleText');
+  const msg = document.getElementById('msg');
+
+  if (isOnline) {
+    if (!confirm('컴퓨터를 끄시겠습니까?')) return;
+    isBusy = true; btn.disabled = true;
+    icon.textContent = '⏳'; text.textContent = '종료 요청 중...'; msg.textContent = '';
+    try {
+      const r = await fetch('/shutdown', { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) {
+        icon.textContent = '✅'; text.textContent = '종료 요청됨';
+        msg.textContent = '✅ ' + d.message;
+        setTimeout(() => { isBusy = false; updateStatus(); }, 3000);
+      } else {
+        msg.textContent = '❌ ' + d.error;
+        isBusy = false; updateStatus();
+      }
+    } catch (e) { msg.textContent = '❌ 네트워크 오류'; isBusy = false; updateStatus(); }
+  } else {
+    if (!confirm('컴퓨터를 켜시겠습니까? (약 30초 소요)')) return;
+    isBusy = true; btn.disabled = true;
+    icon.textContent = '⏳'; text.textContent = '켜는 중...';
+    msg.textContent = '매직 패킷 전송 중...';
+    try {
+      const r = await fetch('/wake', { method: 'POST' });
+      const d = await r.json();
+      if (d.ok) {
+        icon.textContent = '✅'; text.textContent = '켜는 중...';
+        msg.textContent = '✅ ' + d.message;
+        setTimeout(() => { isBusy = false; updateStatus(); }, 30000);
+      } else {
+        msg.textContent = '❌ ' + d.error;
+        isBusy = false; updateStatus();
+      }
+    } catch (e) { msg.textContent = '❌ 네트워크 오류'; isBusy = false; updateStatus(); }
+  }
 }
 
-async function sendShutdown() {
-  if (!isOnline) { document.getElementById('msg').textContent = '❌ 이미 꺼져있습니다.'; return; }
-  if (!confirm('정말로 컴퓨터를 끄시겠습니까?')) return;
-  const btn = document.getElementById('btnShutdown');
-  btn.disabled = true; btn.textContent = '⏳ 처리 중...';
-  try {
-    const r = await fetch('/shutdown', { method: 'POST' });
-    const d = await r.json();
-    document.getElementById('msg').textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
-    if (!d.ok) { btn.disabled = false; btn.textContent = '🔌 끄기'; }
-  } catch (e) { document.getElementById('msg').textContent = '❌ 네트워크 오류'; btn.disabled = false; btn.textContent = '🔌 끄기'; }
+async function logout() {
+  await fetch('/power_logout', { method: 'POST' });
+  location.reload();
 }
 
-async function logout() { await fetch('/power_logout', { method: 'POST' }); location.reload(); }
+function toggleFullscreen() {
+  const el = document.getElementById('desktopSection');
+  if (!document.fullscreenElement && !document.webkitFullscreenElement) {
+    const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+    if (req) {
+      req.call(el).then(() => {
+        if (screen.orientation && screen.orientation.lock) {
+          screen.orientation.lock('landscape').catch(()=>{});
+        }
+      }).catch(()=>{});
+    }
+  } else {
+    const exit = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+    if (exit) exit.call(document);
+    if (screen.orientation && screen.orientation.unlock) {
+      try { screen.orientation.unlock(); } catch(e) {}
+    }
+  }
+}
 
 async function refreshScreenshot() {
   if (!isOnline) {
@@ -696,34 +795,21 @@ async function refreshScreenshot() {
     } else {
       document.getElementById('desktopOverlay').textContent = '● 화면 대기중...';
     }
-  } catch (e) { document.getElementById('desktopOverlay').textContent = '● 연결 오류'; }
+  } catch (e) {
+    document.getElementById('desktopOverlay').textContent = '● 연결 오류';
+  }
 }
 
 async function pingDesktop() {
   try { await fetch('/power_desktop_ping', { method: 'POST' }); } catch(e) {}
 }
 
-const img = document.getElementById('screenImg');
-function handleClick(e) {
-  if (!isOnline) return;
-  const rect = img.getBoundingClientRect();
-  if (rect.width === 0) return;
-  const clientX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
-  const clientY = e.changedTouches ? e.changedTouches[0].clientY : e.clientY;
-  const relX = (clientX - rect.left) / rect.width;
-  const relY = (clientY - rect.top) / rect.height;
-  if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return;
-  sendInput({ type: 'click', x: Math.round(relX * screenW), y: Math.round(relY * screenH) });
-}
-img.addEventListener('click', handleClick);
-img.addEventListener('touchend', function(e){ e.preventDefault(); handleClick(e); });
-
 function sendInput(cmd) {
   fetch('/power_input', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(cmd)
-  });
+  }).catch(()=>{});
 }
 function sendKey(key) { sendInput({ type: 'key', key: key }); }
 function sendHotkey(keys) { sendInput({ type: 'hotkey', keys: keys }); }
@@ -735,7 +821,84 @@ function sendText() {
   inp.value = '';
 }
 
-// ★★★ 1초마다 갱신 ★★★
+const img = document.getElementById('screenImg');
+let pointer = null;
+let lastMoveTime = 0;
+
+function getRelativeCoords(clientX, clientY) {
+  const rect = img.getBoundingClientRect();
+  if (rect.width === 0) return null;
+  const relX = (clientX - rect.left) / rect.width;
+  const relY = (clientY - rect.top) / rect.height;
+  if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return null;
+  return { x: Math.round(relX * screenW), y: Math.round(relY * screenH) };
+}
+
+function onPointerDown(clientX, clientY) {
+  if (!isOnline) return;
+  pointer = { startX: clientX, startY: clientY, time: Date.now(), moved: false };
+}
+
+function onPointerMove(clientX, clientY) {
+  if (!pointer) return;
+  const dx = Math.abs(clientX - pointer.startX);
+  const dy = Math.abs(clientY - pointer.startY);
+  if (dx > 6 || dy > 6) {
+    pointer.moved = true;
+    const now = Date.now();
+    if (now - lastMoveTime > 40) {
+      lastMoveTime = now;
+      const coords = getRelativeCoords(clientX, clientY);
+      if (coords) sendInput({ type: 'move', x: coords.x, y: coords.y });
+    }
+  }
+}
+
+function onPointerUp(clientX, clientY) {
+  if (!pointer) return;
+  const elapsed = Date.now() - pointer.time;
+  if (!pointer.moved && elapsed < 500) {
+    const coords = getRelativeCoords(clientX, clientY);
+    if (coords) sendInput({ type: 'click', x: coords.x, y: coords.y });
+  }
+  pointer = null;
+}
+
+img.addEventListener('touchstart', function(e) {
+  e.preventDefault();
+  const t = e.touches[0];
+  onPointerDown(t.clientX, t.clientY);
+}, { passive: false });
+
+img.addEventListener('touchmove', function(e) {
+  e.preventDefault();
+  const t = e.touches[0];
+  onPointerMove(t.clientX, t.clientY);
+}, { passive: false });
+
+img.addEventListener('touchend', function(e) {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  onPointerUp(t.clientX, t.clientY);
+}, { passive: false });
+
+img.addEventListener('touchcancel', function(e) {
+  pointer = null;
+});
+
+img.addEventListener('mousedown', function(e) {
+  onPointerDown(e.clientX, e.clientY);
+});
+img.addEventListener('mousemove', function(e) {
+  if (pointer) onPointerMove(e.clientX, e.clientY);
+});
+img.addEventListener('mouseup', function(e) {
+  onPointerUp(e.clientX, e.clientY);
+});
+img.addEventListener('mouseleave', function(e) {
+  pointer = null;
+});
+
 updateStatus();
 setInterval(updateStatus, 5000);
 pingDesktop();
