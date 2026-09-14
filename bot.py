@@ -13,8 +13,6 @@ import re
 import aiohttp
 import urllib.parse
 import io
-import socket
-import base64
 from datetime import datetime, timezone, timedelta
 from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify
 
@@ -46,26 +44,10 @@ WEB_HOST = "0.0.0.0"
 WEB_PORT = int(os.getenv("PORT", 5000))
 
 # ============================================================
-# 🔌 컴퓨터 전원 제어 + 원격 데스크톱 설정
+# 🔌 컴퓨터 전원 제어 설정
 # ============================================================
-POWER_PASSWORD = os.getenv("POWER_PASSWORD", "6254")
-AGENT_TOKEN = os.getenv("AGENT_TOKEN", "change-this-agent-token")
-WOL_TARGET = os.getenv("WOL_TARGET", "")
-WOL_MAC = os.getenv("WOL_MAC", "")
-WOL_PORT = int(os.getenv("WOL_PORT", 9))
-
-def send_magic_packet(mac_address, target, port=9):
-    mac_clean = mac_address.replace(":", "").replace("-", "").strip()
-    if len(mac_clean) != 12:
-        raise ValueError("MAC 주소 형식 오류")
-    mac_bytes = bytes.fromhex(mac_clean)
-    packet = b'\xff' * 6 + mac_bytes * 16
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    try:
-        sock.sendto(packet, (target, port))
-    finally:
-        sock.close()
+POWER_PASSWORD = os.getenv("POWER_PASSWORD", "6254")   # /power 페이지 비밀번호
+AGENT_TOKEN = os.getenv("AGENT_TOKEN", "change-this-agent-token")  # PC 에이전트 인증 토큰
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "".join(random.choices(string.ascii_letters + string.digits, k=32)))
@@ -81,19 +63,12 @@ pending_verifications_global = {}
 oauth_states = {}
 verified_users = {}
 
-# 상태 저장 (전원 + 원격)
-shutdown_request = {"requested": False, "requested_at": None}
-pc_status = {
-    "last_heartbeat": 0,
-    "hostname": None,
-    "os": None,
-    "screen_width": 0,
-    "screen_height": 0,
+# 종료 요청 상태 저장
+shutdown_request = {
+    "requested": False,
+    "requested_at": None,
+    "requested_by": None,
 }
-screenshot_store = {"data": None, "updated_at": 0}
-input_queue = []
-input_lock = threading.Lock()
-desktop_session = {"last_ping": 0}
 
 # ============================================================
 # OAuth2 헬퍼 함수
@@ -494,7 +469,7 @@ def home():
     return "✅ Bot is alive and running!", 200
 
 # ============================================================
-# 🔌 /power 페이지 (전원 + 원격 데스크톱)
+# 🔌 /power 페이지 (비밀번호 로그인 → 컴퓨터 끄기 버튼)
 # ============================================================
 POWER_LOGIN_PAGE = """
 <!DOCTYPE html>
@@ -544,7 +519,7 @@ POWER_LOGIN_PAGE = """
 </head>
 <body>
   <div class="box">
-    <h1>🔐 PC 원격 제어</h1>
+    <h1>🔐 PC 원격 전원</h1>
     <p>비밀번호를 입력하세요</p>
     <form method="POST" action="/power_login">
       <input type="password" name="password" inputmode="numeric" maxlength="20" autofocus placeholder="••••">
@@ -562,244 +537,89 @@ POWER_CONTROL_PAGE = """
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>🔌 PC 원격 제어</title>
+<title>🔌 PC 원격 전원</title>
 <style>
-  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; }
-  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-    min-height:100vh; padding:16px; color:#eee; }
-  .box { background:rgba(255,255,255,0.06); backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,0.1); border-radius:20px; padding:20px;
-    max-width:900px; margin:0 auto 16px; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
-  .box h1 { font-size:20px; margin-bottom:6px; font-weight:700; }
-  .box p { font-size:13px; color:#a0aec0; margin-bottom:16px; }
-  .status { display:inline-block; padding:8px 16px; border-radius:20px; font-size:13px;
-    margin-bottom:16px; transition:all 0.3s; }
-  .status.online { background:rgba(72,187,120,0.15); color:#68d391; }
-  .status.offline { background:rgba(245,101,101,0.15); color:#fc8181; }
-  .status.loading { background:rgba(160,174,192,0.15); color:#a0aec0; }
-  .btn-row { display:flex; gap:10px; margin-bottom:14px; }
-  button, a.btn { flex:1; padding:16px; font-size:15px; font-weight:700;
-    border:none; border-radius:14px; cursor:pointer; text-decoration:none;
-    text-align:center; transition:transform 0.15s; }
-  button:active, a.btn:active { transform:scale(0.97); }
-  button:disabled { opacity:0.4; cursor:not-allowed; }
-  .btn-on { background:linear-gradient(135deg,#43a047,#2e7d32); color:#fff; }
-  .btn-off { background:linear-gradient(135deg,#e53935,#b71c1c); color:#fff; }
-  .btn-gray { background:rgba(255,255,255,0.08); color:#a0aec0; border:1px solid rgba(255,255,255,0.15);
-    font-weight:400; font-size:13px; padding:10px; flex:0 0 auto; }
-  #msg { margin-top:12px; font-size:13px; color:#a0aec0; min-height:18px; }
-
-  /* 원격 데스크톱 */
-  .desktop-box { background:#000; border-radius:14px; overflow:hidden; margin-bottom:12px;
-    position:relative; touch-action: none; }
-  #screenImg { width:100%; display:block; cursor:crosshair; image-rendering: auto; }
-  .desktop-overlay { position:absolute; top:8px; left:8px;
-    background:rgba(0,0,0,0.6); color:#68d391; font-size:11px;
-    padding:4px 10px; border-radius:20px; }
-  .keyboard-area { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
-  .keyboard-area input { flex:1; min-width:120px; padding:12px; font-size:14px;
-    background:rgba(0,0,0,0.3); border:2px solid rgba(255,255,255,0.15);
-    border-radius:10px; color:#fff; outline:none; }
-  .keyboard-area input:focus { border-color:#667eea; }
-  .keyboard-area button { flex:0 0 auto; padding:12px 18px; font-size:14px; }
-  .special-keys { display:flex; gap:6px; flex-wrap:wrap; }
-  .special-keys button { flex:1; padding:10px; font-size:12px; font-weight:500;
-    background:rgba(255,255,255,0.08); color:#cbd5e0;
-    border:1px solid rgba(255,255,255,0.15); border-radius:8px; }
-  .section-title { font-size:14px; color:#a0aec0; margin:16px 0 10px; font-weight:600; }
-  .hidden { display:none !important; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    padding: 20px; color: #eee;
+  }
+  .box {
+    background: rgba(255,255,255,0.08);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 24px; padding: 40px 30px;
+    max-width: 400px; width: 100%;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+    text-align: center;
+  }
+  .box h1 { font-size: 22px; margin-bottom: 8px; font-weight: 700; }
+  .box p { font-size: 14px; color: #a0aec0; margin-bottom: 30px; }
+  .danger {
+    width: 100%; padding: 28px;
+    font-size: 24px; font-weight: 700;
+    background: linear-gradient(135deg, #e53935 0%, #b71c1c 100%);
+    color: #fff; border: none; border-radius: 18px;
+    cursor: pointer; transition: transform 0.15s, box-shadow 0.15s;
+    box-shadow: 0 8px 24px rgba(229,57,53,0.35);
+    margin-bottom: 16px;
+  }
+  .danger:active { transform: scale(0.97); }
+  .danger:disabled { opacity: 0.6; cursor: not-allowed; }
+  .gray {
+    padding: 12px 20px; font-size: 14px;
+    background: rgba(255,255,255,0.1);
+    color: #cbd5e0; border: 1px solid rgba(255,255,255,0.15);
+    border-radius: 12px; cursor: pointer; margin-top: 6px;
+  }
+  #msg { margin-top: 20px; font-size: 14px; color: #a0aec0; min-height: 20px; }
+  .status {
+    display: inline-block; padding: 6px 14px;
+    background: rgba(72,187,120,0.15); color: #68d391;
+    border-radius: 20px; font-size: 12px; margin-bottom: 20px;
+  }
 </style>
 </head>
 <body>
-  <!-- 전원 제어 -->
   <div class="box">
-    <div id="pcStatus" class="status loading">● 확인 중...</div>
-    <h1>🔌 PC 원격 제어</h1>
-    <p>컴퓨터 전원을 켜거나 끌 수 있어요</p>
-    <div class="btn-row">
-      <button class="btn-on" id="btnWake" onclick="wakePC()">⏻ 켜기</button>
-      <button class="btn-off" id="btnShutdown" onclick="sendShutdown()">🔌 끄기</button>
-    </div>
+    <span class="status">● 로그인됨</span>
+    <h1>PC 원격 전원</h1>
+    <p>버튼을 누르면 컴퓨터가 종료됩니다</p>
+    <button class="danger" id="btn" onclick="sendShutdown()">🔌 컴퓨터 끄기</button>
+    <br>
+    <button class="gray" onclick="logout()">로그아웃</button>
     <div id="msg"></div>
-    <button class="btn-gray" onclick="logout()" style="margin-top:10px;">로그아웃</button>
   </div>
 
-  <!-- 원격 데스크톱 -->
-  <div class="box" id="desktopBox">
-    <h1>🖥️ 원격 데스크톱</h1>
-    <p>화면을 터치하면 그 위치를 클릭합니다</p>
-    <div class="desktop-box" id="desktopFrame">
-      <div class="desktop-overlay" id="desktopOverlay">● 연결 대기</div>
-      <img id="screenImg" alt="화면" draggable="false">
-    </div>
-
-    <div class="keyboard-area">
-      <input type="text" id="textInput" placeholder="텍스트 입력 후 전송"
-             onkeydown="if(event.key==='Enter'){sendText();event.preventDefault();}">
-      <button class="btn-on" onclick="sendText()" style="flex:0 0 auto;">입력</button>
-    </div>
-
-    <div class="special-keys">
-      <button onclick="sendKey('enter')">⏎ Enter</button>
-      <button onclick="sendKey('backspace')">⌫ Back</button>
-      <button onclick="sendKey('tab')">⇥ Tab</button>
-      <button onclick="sendKey('esc')">⎋ Esc</button>
-      <button onclick="sendKey('up')">↑</button>
-      <button onclick="sendKey('down')">↓</button>
-      <button onclick="sendKey('left')">←</button>
-      <button onclick="sendKey('right')">→</button>
-      <button onclick="sendHotkey(['ctrl','c'])">Ctrl+C</button>
-      <button onclick="sendHotkey(['ctrl','v'])">Ctrl+V</button>
-      <button onclick="sendHotkey(['ctrl','a'])">Ctrl+A</button>
-      <button onclick="sendHotkey(['alt','f4'])">Alt+F4</button>
-    </div>
-  </div>
-
-<script>
-let isOnline = false;
-let screenW = 1920, screenH = 1080;
-let desktopPinging = false;
-
-async function updateStatus() {
-  const el = document.getElementById('pcStatus');
-  try {
-    const r = await fetch('/pc_status');
-    const d = await r.json();
-    if (!d.ok) { el.textContent = '● 세션 만료'; el.className = 'status offline'; return; }
-    isOnline = d.online;
-    if (d.online) {
-      el.textContent = '● 켜져있음 (' + (d.hostname || 'PC') + ')';
-      el.className = 'status online';
-      document.getElementById('btnShutdown').disabled = false;
-      document.getElementById('btnWake').disabled = true;
-      screenW = d.screen_width || 1920;
-      screenH = d.screen_height || 1080;
-    } else {
-      el.textContent = '● 꺼져있음';
-      el.className = 'status offline';
-      document.getElementById('btnShutdown').disabled = true;
-      document.getElementById('btnWake').disabled = false;
+  <script>
+    async function sendShutdown() {
+      if (!confirm('정말로 컴퓨터를 끄시겠습니까?')) return;
+      const btn = document.getElementById('btn');
+      btn.disabled = true;
+      btn.textContent = '⏳ 요청 중...';
+      try {
+        const r = await fetch('/shutdown', { method: 'POST' });
+        const d = await r.json();
+        document.getElementById('msg').textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
+        if (d.ok) {
+          btn.textContent = '✅ 요청됨';
+        } else {
+          btn.disabled = false;
+          btn.textContent = '🔌 컴퓨터 끄기';
+        }
+      } catch (e) {
+        document.getElementById('msg').textContent = '❌ 네트워크 오류: ' + e;
+        btn.disabled = false;
+        btn.textContent = '🔌 컴퓨터 끄기';
+      }
     }
-  } catch (e) { el.textContent = '● 상태 확인 실패'; el.className = 'status offline'; }
-}
-
-async function wakePC() {
-  if (isOnline) { showMsg('⚠️ 이미 켜져있습니다.'); return; }
-  if (!confirm('컴퓨터를 켜시겠습니까? (약 30초 소요)')) return;
-  showMsg('⏳ 매직 패킷 전송 중...');
-  try {
-    const r = await fetch('/wake', { method: 'POST' });
-    const d = await r.json();
-    showMsg(d.ok ? '✅ ' + d.message : '❌ ' + d.error);
-    if (d.ok) setTimeout(updateStatus, 30000);
-  } catch (e) { showMsg('❌ 네트워크 오류'); }
-}
-
-async function sendShutdown() {
-  if (!isOnline) { showMsg('❌ 이미 꺼져있습니다.'); return; }
-  if (!confirm('정말로 컴퓨터를 끄시겠습니까?')) return;
-  const btn = document.getElementById('btnShutdown');
-  btn.disabled = true; btn.textContent = '⏳ 처리 중...';
-  try {
-    const r = await fetch('/shutdown', { method: 'POST' });
-    const d = await r.json();
-    showMsg(d.ok ? '✅ ' + d.message : '❌ ' + d.error);
-    if (!d.ok) { btn.disabled = false; btn.textContent = '🔌 끄기'; }
-  } catch (e) { showMsg('❌ 네트워크 오류'); btn.disabled = false; btn.textContent = '🔌 끄기'; }
-}
-
-function showMsg(t) { document.getElementById('msg').textContent = t; }
-
-async function logout() {
-  await fetch('/power_logout', { method: 'POST' });
-  location.reload();
-}
-
-// ============ 원격 데스크톱 ============
-async function refreshScreenshot() {
-  if (!isOnline) {
-    document.getElementById('desktopOverlay').textContent = '● PC 오프라인';
-    document.getElementById('screenImg').src = '';
-    return;
-  }
-  try {
-    const r = await fetch('/power_screenshot');
-    const d = await r.json();
-    if (d.ok && d.image) {
-      document.getElementById('screenImg').src = 'data:image/jpeg;base64,' + d.image;
-      const age = Math.round(Date.now() / 1000 - d.updated_at);
-      document.getElementById('desktopOverlay').textContent = '● 화면 (' + age + '초 전)';
-    } else {
-      document.getElementById('desktopOverlay').textContent = '● 화면 대기중...';
+    async function logout() {
+      await fetch('/power_logout', { method: 'POST' });
+      location.reload();
     }
-  } catch (e) {
-    document.getElementById('desktopOverlay').textContent = '● 연결 오류';
-  }
-}
-
-// 데스크톱 세션 유지 (스크린샷 요청 트리거)
-async function pingDesktop() {
-  try { await fetch('/power_desktop_ping', { method: 'POST' }); } catch(e) {}
-}
-
-// 마우스 클릭 좌표 전송
-const img = document.getElementById('screenImg');
-function handleClick(e) {
-  if (!isOnline) return;
-  const rect = img.getBoundingClientRect();
-  if (rect.width === 0) return;
-  const clientX = e.changedTouches ? e.changedTouches[0].clientX : e.clientX;
-  const clientY = e.changedTouches ? e.changedTouches[0].clientY : e.clientY;
-  const relX = (clientX - rect.left) / rect.width;
-  const relY = (clientY - rect.top) / rect.height;
-  if (relX < 0 || relX > 1 || relY < 0 || relY > 1) return;
-  const x = Math.round(relX * screenW);
-  const y = Math.round(relY * screenH);
-  sendInput({ type: 'click', x: x, y: y });
-  // 클릭 후 바로 스크린샷 갱신
-  setTimeout(refreshScreenshot, 400);
-}
-img.addEventListener('click', handleClick);
-img.addEventListener('touchend', function(e){ e.preventDefault(); handleClick(e); });
-
-function sendInput(cmd) {
-  fetch('/power_input', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(cmd)
-  });
-}
-
-function sendKey(key) {
-  sendInput({ type: 'key', key: key });
-  setTimeout(refreshScreenshot, 400);
-}
-
-function sendHotkey(keys) {
-  sendInput({ type: 'hotkey', keys: keys });
-  setTimeout(refreshScreenshot, 400);
-}
-
-function sendText() {
-  const inp = document.getElementById('textInput');
-  const txt = inp.value;
-  if (!txt) return;
-  sendInput({ type: 'text', text: txt });
-  inp.value = '';
-  setTimeout(refreshScreenshot, 500);
-}
-
-// ============ 루프 ============
-updateStatus();
-setInterval(updateStatus, 5000);
-
-pingDesktop();
-setInterval(pingDesktop, 8000);
-
-refreshScreenshot();
-setInterval(refreshScreenshot, 2000);
-</script>
+  </script>
 </body>
 </html>
 """
@@ -826,118 +646,35 @@ def power_logout():
     session.pop('power_login_at', None)
     return jsonify({"ok": True})
 
-# --- 상태 ---
-@app.route('/heartbeat', methods=['POST'])
-def heartbeat():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    pc_status["last_heartbeat"] = time.time()
-    pc_status["hostname"] = data.get("hostname", "알 수 없음")
-    pc_status["os"] = data.get("os", "알 수 없음")
-    pc_status["screen_width"] = int(data.get("screen_width", 0))
-    pc_status["screen_height"] = int(data.get("screen_height", 0))
-    return jsonify({"ok": True})
-
-@app.route('/pc_status')
-def pc_status_route():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    elapsed = time.time() - pc_status["last_heartbeat"]
-    is_online = elapsed < 30
-    return jsonify({
-        "ok": True,
-        "online": is_online,
-        "hostname": pc_status["hostname"],
-        "os": pc_status["os"],
-        "screen_width": pc_status["screen_width"],
-        "screen_height": pc_status["screen_height"],
-        "last_seen_seconds": int(elapsed) if pc_status["last_heartbeat"] > 0 else None,
-    })
-
-# --- 종료 ---
 @app.route('/shutdown', methods=['POST'])
 def request_shutdown():
+    """핸드폰에서 '컴퓨터 끄기' 버튼을 누르면 호출됨"""
     if not session.get('power_logged_in'):
         return jsonify({"ok": False, "error": "로그인이 필요합니다."}), 401
-    if time.time() - pc_status["last_heartbeat"] >= 30:
-        return jsonify({"ok": False, "error": "이미 꺼져있습니다."})
+
     shutdown_request["requested"] = True
     shutdown_request["requested_at"] = time.time()
-    return jsonify({"ok": True, "message": "종료 요청이 접수되었습니다."})
+    shutdown_request["requested_by"] = f"session_{session.get('power_login_at')}"
+
+    print(f"🔌 종료 요청 접수됨")
+    return jsonify({"ok": True, "message": "종료 요청이 접수되었습니다. 잠시 후 컴퓨터가 꺼집니다."})
 
 @app.route('/check_shutdown', methods=['GET'])
 def check_shutdown():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
+    """PC의 에이전트가 주기적으로 호출해서 종료 요청이 있는지 확인"""
+    agent_token = request.headers.get('X-Agent-Token')
+    if agent_token != AGENT_TOKEN:
         return jsonify({"ok": False, "error": "unauthorized"}), 401
+
     if shutdown_request["requested"]:
         shutdown_request["requested"] = False
-        return jsonify({"ok": True, "shutdown": True})
+        return jsonify({
+            "ok": True,
+            "shutdown": True,
+            "requested_at": shutdown_request["requested_at"],
+        })
+
     return jsonify({"ok": True, "shutdown": False})
-
-# --- 켜기 (WOL) ---
-@app.route('/wake', methods=['POST'])
-def wake_pc():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인이 필요합니다."}), 401
-    if time.time() - pc_status["last_heartbeat"] < 30:
-        return jsonify({"ok": False, "error": "이미 켜져있습니다."})
-    if not WOL_TARGET or not WOL_MAC:
-        return jsonify({"ok": False, "error": "WOL 미설정 (WOL_TARGET, WOL_MAC 환경변수 필요)"})
-    try:
-        send_magic_packet(WOL_MAC, WOL_TARGET, WOL_PORT)
-        return jsonify({"ok": True, "message": "매직 패킷 전송됨. 30초 후 확인하세요."})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# --- 원격 데스크톱 ---
-@app.route('/agent_screenshot', methods=['POST'])
-def agent_screenshot():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    screenshot_store["data"] = data.get("image")
-    screenshot_store["updated_at"] = time.time()
-    return jsonify({"ok": True})
-
-@app.route('/agent_input', methods=['GET'])
-def agent_input():
-    """에이전트가 폴링: 캡처 요청 여부 + 대기 중인 입력 명령 반환"""
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    capture = (time.time() - desktop_session["last_ping"]) < 15
-    with input_lock:
-        cmds = list(input_queue)
-        input_queue.clear()
-    return jsonify({"ok": True, "capture": capture, "commands": cmds})
-
-@app.route('/power_screenshot', methods=['GET'])
-def power_screenshot():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    return jsonify({
-        "ok": True,
-        "image": screenshot_store["data"],
-        "updated_at": screenshot_store["updated_at"],
-    })
-
-@app.route('/power_input', methods=['POST'])
-def power_input():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    cmd = request.get_json(silent=True) or {}
-    with input_lock:
-        input_queue.append(cmd)
-        if len(input_queue) > 100:
-            input_queue[:] = input_queue[-100:]
-    return jsonify({"ok": True})
-
-@app.route('/power_desktop_ping', methods=['POST'])
-def power_desktop_ping():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False}), 401
-    desktop_session["last_ping"] = time.time()
-    return jsonify({"ok": True})
 
 # ============================================================
 # OAuth2 라우트 (기존 인증봇용)
