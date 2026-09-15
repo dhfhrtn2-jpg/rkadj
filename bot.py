@@ -19,10 +19,9 @@ from flask import Flask, request, render_template_string, redirect, session, url
 # ============================================================
 # 공통 설정 (환경변수)
 # ============================================================
-TOKEN = os.getenv("DISCORD_BOT_TOKEN")  # 인증봇 토큰 (단일)
+TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
-CONFIG_PATH = "config.json"             # 하나만 사용
-BACKUP_PATH = "backup.json"             # (복구 기능 없어도 저장/복구 명령어는 그대로 둠, 필요하면 삭제 가능)
+CONFIG_PATH = "config.json"
 CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
@@ -38,7 +37,7 @@ DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
 ALLOWED_USER_IDS = [
-    1379356844920799255,  # 본인 ID
+    1379356844920799255,
 ]
 
 WEB_HOST = "0.0.0.0"
@@ -67,7 +66,7 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "created_at": time.time(),
         "guild_id": guild_id,
         "user_id": user_id,
-        "bot_name": bot_name or "인증봇"
+        "bot_name": bot_name
     }
     params = {
         "client_id": DISCORD_CLIENT_ID,
@@ -132,7 +131,7 @@ def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
     return False
 
 # ============================================================
-# 봇 생성 (단일 봇, 복구 관련 기능 제거)
+# 봇 클라이언트
 # ============================================================
 intents = discord.Intents.default()
 intents.members = True
@@ -140,11 +139,12 @@ intents.message_content = True
 intents.guilds = True
 
 bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
-bot.bot_name = "인증봇"
-bot.custom_console_button_id = f"verify_console_{bot.bot_name}"
 bot.bot_token = TOKEN
+bot.custom_console_button_id = f"verify_console_authbot"
 
-# 설정 파일 로드/저장 (단일)
+# ============================================================
+# 설정 저장/로드
+# ============================================================
 def load_config():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -177,6 +177,9 @@ def is_authorized(ctx):
 def is_bot_owner(ctx):
     return ctx.author.id in ALLOWED_USER_IDS
 
+# ============================================================
+# 명령어
+# ============================================================
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
@@ -193,9 +196,6 @@ async def on_command_error(ctx, error):
         traceback.print_exc()
         await ctx.send(f"❌ 오류가 발생했습니다: {str(error)}")
 
-# ============================================================
-# 명령어 (저장/복구는 그대로 두되, 복구는 인증봇에서 사용 안 함)
-# ============================================================
 @bot.command(name="유저등록")
 @commands.check(is_bot_owner)
 async def register_user(ctx, member: discord.Member):
@@ -205,7 +205,7 @@ async def register_user(ctx, member: discord.Member):
     if member.id not in cfg["authorized_users"]:
         cfg["authorized_users"].append(member.id)
         save_config(cfg)
-        await ctx.send(f"✅ {member.mention} 님이 `?저장` / `?복구` 사용 권한을 얻었습니다.")
+        await ctx.send(f"✅ {member.mention} 님이 명령어 사용 권한을 얻었습니다.")
     else:
         await ctx.send(f"⚠️ {member.mention} 님은 이미 등록되어 있습니다.")
 
@@ -215,7 +215,7 @@ async def set_verify_role(ctx: commands.Context, role: discord.Role):
     gcfg = get_guild_cfg(ctx.guild.id)
     gcfg["verify_role"] = role.id
     save_config(config)
-    await ctx.send(f"✅ 인증 통과 시 지급할 역할을 {role.mention} 로 설정했어요.")
+    await ctx.send(f"✅ 인증 통과 시 지급할 역할을 {role.mention} 로 설정했어요.\n(기존 역할은 제거되지 않습니다)")
 
 @bot.command(name="로그채널")
 @commands.check(is_authorized)
@@ -314,7 +314,7 @@ async def create_console(ctx: commands.Context):
         description="아래 버튼을 눌러 **디스코드로 로그인**하고 인증을 완료하세요.",
         color=discord.Color.blurple()
     )
-    view = ConsoleView(bot.custom_console_button_id, bot.bot_name)
+    view = ConsoleView(bot.custom_console_button_id)
     await ctx.send(embed=embed, view=view)
 
 @bot.command(name="재인증")
@@ -367,97 +367,54 @@ async def reauth_all(ctx: commands.Context):
 
     await ctx.send(f"✅ {removed_count}명의 사용자에게서 인증 역할이 제거되었습니다.")
 
-# ============================================================
-# 저장 / 복구 (복구는 필요 없지만 저장은 유지, 복구 명령어는 제거)
-# ============================================================
-@bot.command(name="저장")
+@bot.command(name="설정확인")
 @commands.check(is_authorized)
-async def save_server(ctx):
-    guild = ctx.guild
-    backup_data = {}
+async def check_config(ctx: commands.Context):
+    """현재 서버의 설정 상태를 확인합니다."""
+    gcfg = get_guild_cfg(ctx.guild.id)
+    verify_role_id = gcfg.get("verify_role")
+    log_channel_id = gcfg.get("log_channel")
+    main_category_id = gcfg.get("main_category_id")
+    allowed_role_id = gcfg.get("allowed_role_id")
+    exception_ids = gcfg.get("exception_category_ids", [])
 
-    roles_data = []
-    for role in guild.roles:
-        if role.is_default() or role.managed:
-            continue
-        roles_data.append({
-            "id": str(role.id),
-            "name": role.name,
-            "color": role.color.value,
-            "hoist": role.hoist,
-            "mentionable": role.mentionable,
-            "permissions": role.permissions.value,
-            "position": role.position
-        })
-    backup_data["roles"] = roles_data
+    verify_role = ctx.guild.get_role(verify_role_id) if verify_role_id else None
+    log_channel = ctx.guild.get_channel(log_channel_id) if log_channel_id else None
+    main_category = ctx.guild.get_channel(main_category_id) if main_category_id else None
+    allowed_role = ctx.guild.get_role(allowed_role_id) if allowed_role_id else None
 
-    categories_data = []
-    for cat in guild.categories:
-        overwrites = []
-        for target, overwrite in cat.overwrites.items():
-            if isinstance(target, discord.Role):
-                if target.is_default() or target.managed:
-                    continue
-                overwrites.append({
-                    "target_type": "role",
-                    "target_id": str(target.id),
-                    "allow": overwrite.pair()[0].value,
-                    "deny": overwrite.pair()[1].value
-                })
-            elif isinstance(target, discord.Member):
-                overwrites.append({
-                    "target_type": "user",
-                    "target_id": str(target.id),
-                    "allow": overwrite.pair()[0].value,
-                    "deny": overwrite.pair()[1].value
-                })
-        categories_data.append({
-            "id": str(cat.id),
-            "name": cat.name,
-            "position": cat.position,
-            "overwrites": overwrites
-        })
-    backup_data["categories"] = categories_data
-
-    channels_data = []
-    for ch in guild.channels:
-        if isinstance(ch, discord.CategoryChannel):
-            continue
-        if isinstance(ch, discord.TextChannel) or isinstance(ch, discord.VoiceChannel):
-            overwrites = []
-            for target, overwrite in ch.overwrites.items():
-                if isinstance(target, discord.Role):
-                    if target.is_default() or target.managed:
-                        continue
-                    overwrites.append({
-                        "target_type": "role",
-                        "target_id": str(target.id),
-                        "allow": overwrite.pair()[0].value,
-                        "deny": overwrite.pair()[1].value
-                    })
-                elif isinstance(target, discord.Member):
-                    overwrites.append({
-                        "target_type": "user",
-                        "target_id": str(target.id),
-                        "allow": overwrite.pair()[0].value,
-                        "deny": overwrite.pair()[1].value
-                    })
-            channels_data.append({
-                "id": str(ch.id),
-                "name": ch.name,
-                "type": str(ch.type),
-                "position": ch.position,
-                "parent_id": str(ch.category.id) if ch.category else None,
-                "overwrites": overwrites
-            })
-    backup_data["channels"] = channels_data
-
-    with open(BACKUP_PATH, "w", encoding="utf-8") as f:
-        json.dump(backup_data, f, indent=4, ensure_ascii=False)
-
-    await ctx.send("✅ 서버 구조가 성공적으로 백업되었습니다.")
-
-# (복구 명령어는 제거)
+    embed = discord.Embed(
+        title="⚙️ 서버 설정 현황",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(
+        name="인증 역할",
+        value=verify_role.mention if verify_role else "❌ 설정 안 됨",
+        inline=False
+    )
+    embed.add_field(
+        name="로그 채널",
+        value=log_channel.mention if log_channel else "❌ 설정 안 됨",
+        inline=False
+    )
+    embed.add_field(
+        name="인증 메인 카테고리",
+        value=main_category.name if main_category else "❌ 설정 안 됨",
+        inline=False
+    )
+    embed.add_field(
+        name="인증채널 허용 역할",
+        value=allowed_role.mention if allowed_role else "❌ 설정 안 됨",
+        inline=False
+    )
+    embed.add_field(
+        name="예외 카테고리 수",
+        value=f"{len(exception_ids)}개",
+        inline=False
+    )
+    embed.set_footer(text=f"config.json 크기: {os.path.getsize(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0} bytes")
+    await ctx.send(embed=embed)
 
 # ============================================================
 # 권한 설정 헬퍼
@@ -486,7 +443,7 @@ async def setup_all_permissions(guild, main_category_id, allowed_role_id, except
         except discord.Forbidden:
             pass
         except Exception as e:
-            print(f"[인증봇] 권한 설정 오류 ({channel.name}): {e}")
+            print(f"권한 설정 오류 ({channel.name}): {e}")
 
     for cat_id in exception_category_ids:
         cat = guild.get_channel(cat_id)
@@ -502,13 +459,12 @@ async def setup_all_permissions(guild, main_category_id, allowed_role_id, except
                         pass
 
 # ============================================================
-# ConsoleView
+# ConsoleView (버튼)
 # ============================================================
 class ConsoleView(discord.ui.View):
-    def __init__(self, custom_id, bot_name):
+    def __init__(self, custom_id):
         super().__init__(timeout=None)
         self.custom_id = custom_id
-        self.bot_name = bot_name
 
     @discord.ui.button(label="🔑 디스코드로 인증하기", style=discord.ButtonStyle.blurple, emoji="🔐", custom_id=CONSOLE_BUTTON_ID)
     async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -525,7 +481,7 @@ class ConsoleView(discord.ui.View):
             oauth_url = generate_oauth2_url(
                 guild_id=interaction.guild_id,
                 user_id=interaction.user.id,
-                bot_name=self.bot_name
+                bot_name="인증봇"
             )
 
             embed = discord.Embed(
@@ -549,30 +505,39 @@ class ConsoleView(discord.ui.View):
                 pass
 
 # ============================================================
-# 셀프 핑 (Keep-Alive)
+# 셀프 핑
 # ============================================================
 @tasks.loop(minutes=10)
 async def keep_alive():
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(BASE_URL, timeout=10) as resp:
-                print(f"✅ [인증봇] 셀프 핑 성공! (상태: {resp.status})")
+                print(f"✅ 셀프 핑 성공! (상태: {resp.status})")
     except Exception as e:
-        print(f"⚠️ [인증봇] 셀프 핑 실패: {e}")
+        print(f"⚠️ 셀프 핑 실패: {e}")
 
+# ============================================================
+# 봇 이벤트
+# ============================================================
 @bot.event
 async def on_ready():
     if not hasattr(bot, "console_view_added"):
-        view = ConsoleView(bot.custom_console_button_id, bot.bot_name)
+        view = ConsoleView(bot.custom_console_button_id)
         bot.add_view(view)
         bot.console_view_added = True
 
     if not hasattr(bot, "keep_alive_started"):
         keep_alive.start()
         bot.keep_alive_started = True
-        print(f"🔄 [인증봇] 셀프 핑 루프 시작됨 (10분 간격)")
+        print("🔄 셀프 핑 루프 시작됨 (10분 간격)")
 
-    print(f"✅ [인증봇] {bot.user} 로 로그인 완료! (접두사: ?)")
+    # 현재 로드된 설정 정보 출력
+    print(f"📁 CONFIG_PATH: {CONFIG_PATH}")
+    print(f"📁 config.json 존재 여부: {os.path.exists(CONFIG_PATH)}")
+    if os.path.exists(CONFIG_PATH):
+        print(f"📁 config.json 내용: {json.dumps(config, ensure_ascii=False, indent=2)[:500]}")
+
+    print(f"✅ {bot.user} 로 로그인 완료! (접두사: ?)")
 
 # ============================================================
 # Flask 라우트
@@ -593,7 +558,7 @@ def oauth2_login():
             "created_at": time.time(),
             "guild_id": guild_id,
             "user_id": user_id,
-            "bot_name": bot_name or "인증봇"
+            "bot_name": bot_name
         }
         
         params = {
@@ -884,7 +849,6 @@ def captcha_page():
                 msg_type="error"
             )
         
-        # 단일 봇이므로 bot 객체를 바로 사용
         target_bot = bot
         
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
@@ -952,30 +916,44 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 래퍼 (VPN/모바일 차단 + 서버 목록 파일)
+# 웹 인증 처리 (역할 제거 없음 + 로그 디버깅)
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, user_agent):
     try:
+        print(f"[DEBUG] 인증 시작 - guild_id: {guild_id}, user_id: {user_id}")
+        
         guild = bot_instance.get_guild(guild_id)
         if not guild:
             return False, "서버를 찾을 수 없습니다."
+        print(f"[DEBUG] 서버 찾음: {guild.name}")
 
         member = guild.get_member(user_id)
         if not member:
             return False, "서버에서 해당 사용자를 찾을 수 없습니다."
+        print(f"[DEBUG] 멤버 찾음: {member}")
 
-        config_path = CONFIG_PATH
-        with open(config_path, "r", encoding="utf-8") as f:
-            config = json.load(f)
-        gcfg = config.get(str(guild_id), {})
+        # 설정 로드
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+            print(f"[DEBUG] config.json 로드 성공")
+        except Exception as e:
+            print(f"[DEBUG] config.json 로드 실패: {e}")
+            config_data = {}
+        
+        gcfg = config_data.get(str(guild_id), {})
+        print(f"[DEBUG] guild config: {gcfg}")
 
         verify_role_id = gcfg.get("verify_role")
+        print(f"[DEBUG] verify_role_id: {verify_role_id}")
+        
         if not verify_role_id:
-            return False, "인증 역할이 설정되지 않았습니다."
+            return False, "인증 역할이 설정되지 않았습니다. 관리자가 `?인증역할 @역할`을 실행해야 합니다."
 
         role = guild.get_role(verify_role_id)
         if not role:
-            return False, "설정된 역할이 존재하지 않습니다."
+            return False, "설정된 역할이 존재하지 않습니다. 역할이 삭제되었을 수 있습니다."
+        print(f"[DEBUG] 역할 찾음: {role.name}")
 
         # ============================================================
         # VPN / 모바일 데이터 감지
@@ -999,11 +977,12 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                         location = country or "알 수 없음"
                     isp = geo_data.get('isp', '알 수 없음')
                     org = geo_data.get('org', '알 수 없음')
-        except:
-            pass
+        except Exception as e:
+            print(f"[DEBUG] IP 정보 조회 실패: {e}")
 
         is_vpn = detect_vpn(isp, org)
         is_mobile = detect_mobile_data(isp, org, user_agent)
+        print(f"[DEBUG] is_vpn: {is_vpn}, is_mobile: {is_mobile}")
 
         if is_vpn:
             return False, "❌ VPN/프록시 사용은 인증이 불가능합니다. VPN을 해제하고 다시 시도해주세요."
@@ -1011,27 +990,24 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             return False, "❌ 모바일 데이터(셀룰러) 사용은 인증이 불가능합니다. Wi-Fi로 연결 후 다시 시도해주세요."
 
         # ============================================================
-        # 역할 부여
+        # ✅ 역할 지급 (기존 역할 제거 없음!)
         # ============================================================
-        removable_roles = [
-            r for r in member.roles
-            if r != guild.default_role and r < guild.me.top_role
-        ]
-        if removable_roles:
-            await member.remove_roles(*removable_roles, reason="웹 인증 완료 - 역할 초기화")
-        await member.add_roles(role, reason="웹 인증 완료")
+        try:
+            await member.add_roles(role, reason="웹 인증 완료")
+            print(f"[DEBUG] 역할 지급 성공: {role.name}")
+        except discord.Forbidden:
+            return False, "봇의 역할이 인증 역할보다 낮아서 지급할 수 없습니다. 봇 역할을 위로 올려주세요."
+        except Exception as e:
+            return False, f"역할 지급 실패: {str(e)}"
 
+        # 인증 기록
         guild_key = str(guild_id)
         if guild_key not in verified_users:
             verified_users[guild_key] = []
         if user_id not in [u["user_id"] for u in verified_users[guild_key]]:
-            verified_users[guild_key].append({
-                "user_id": user_id
-            })
+            verified_users[guild_key].append({"user_id": user_id})
 
-        # ============================================================
-        # 사용자 서버 목록 (파일 생성)
-        # ============================================================
+        # 서버 목록 파일 생성
         user_guilds = []
         guilds_file = None
         if access_token:
@@ -1045,11 +1021,9 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                         filename=f"서버목록_{user_id}_{int(time.time())}.txt"
                     )
             except Exception as e:
-                print(f"서버 목록 가져오기 실패: {e}")
+                print(f"[DEBUG] 서버 목록 실패: {e}")
 
-        # ============================================================
         # 계정 생성일
-        # ============================================================
         created_at = user_data.get('created_at')
         created_str = "알 수 없음"
         days_ago = "알 수 없음"
@@ -1067,11 +1041,15 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
             email = "이메일 없음"
 
         # ============================================================
-        # 로그 채널 전송
+        # 로그 전송 (디버깅 강화)
         # ============================================================
         log_channel_id = gcfg.get("log_channel")
+        print(f"[DEBUG] log_channel_id: {log_channel_id}")
+        
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
+            print(f"[DEBUG] log_channel: {log_channel}")
+            
             if log_channel:
                 now_kst = datetime.now(KST)
                 embed = discord.Embed(
@@ -1085,51 +1063,18 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                     value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})",
                     inline=False
                 )
-                embed.add_field(
-                    name="이메일",
-                    value=email,
-                    inline=False
-                )
-                embed.add_field(
-                    name="계정 생성일",
-                    value=f"{created_str} ({days_ago})",
-                    inline=False
-                )
-                embed.add_field(
-                    name="인증 시작",
-                    value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"),
-                    inline=False
-                )
+                embed.add_field(name="이메일", value=email, inline=False)
+                embed.add_field(name="계정 생성일", value=f"{created_str} ({days_ago})", inline=False)
+                embed.add_field(name="인증 시각", value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"), inline=False)
                 embed.add_field(
                     name="아이피 정보",
                     value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}",
                     inline=False
                 )
-                embed.add_field(
-                    name="기기 정보",
-                    value=f"브라우저: {user_agent[:50]}",
-                    inline=False
-                )
-                embed.add_field(
-                    name="VPN 사용",
-                    value="❌ 예" if is_vpn else "✅ 아니오",
-                    inline=True
-                )
-                embed.add_field(
-                    name="모바일 데이터",
-                    value="❌ 예" if is_mobile else "✅ 아니오",
-                    inline=True
-                )
-                embed.add_field(
-                    name="참가 서버 수",
-                    value=f"{len(user_guilds)}개" + (" (파일 첨부)" if guilds_file else ""),
-                    inline=False
-                )
-                embed.add_field(
-                    name="예상 복구 인원",
-                    value=f"{len(verified_users.get(guild_key, []))} 명",
-                    inline=False
-                )
+                embed.add_field(name="기기 정보", value=f"브라우저: {user_agent[:50]}", inline=False)
+                embed.add_field(name="VPN 사용", value="❌ 예" if is_vpn else "✅ 아니오", inline=True)
+                embed.add_field(name="모바일 데이터", value="❌ 예" if is_mobile else "✅ 아니오", inline=True)
+                embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개" + (" (파일 첨부)" if guilds_file else ""), inline=False)
                 embed.set_thumbnail(url=member.display_avatar.url)
                 
                 try:
@@ -1137,12 +1082,19 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                         await log_channel.send(embed=embed, file=guilds_file)
                     else:
                         await log_channel.send(embed=embed)
+                    print(f"[DEBUG] 로그 전송 성공")
                 except Exception as e:
-                    print(f"로그 전송 오류: {e}")
+                    print(f"[DEBUG] 로그 전송 실패: {e}")
+                    traceback.print_exc()
+            else:
+                print(f"[DEBUG] 로그 채널을 찾을 수 없음 (ID: {log_channel_id})")
+        else:
+            print(f"[DEBUG] 로그 채널이 설정되지 않음. `?로그채널 #채널`을 실행하세요.")
 
         return True, f"역할 {role.name}이 지급되었습니다."
 
     except Exception as e:
+        print(f"[DEBUG] 예외 발생: {e}")
         traceback.print_exc()
         return False, f"오류 발생: {str(e)}"
 
@@ -1159,10 +1111,7 @@ if __name__ == "__main__":
     if not TOKEN:
         print("❌ DISCORD_BOT_TOKEN 환경변수가 설정되지 않았습니다!")
     else:
-        # Flask를 별도 스레드로 실행
         thread = threading.Thread(target=run_flask, daemon=True)
         thread.start()
         print("🌐 웹서버가 http://0.0.0.0:5000 에서 실행 중입니다.")
-        
-        # 봇 실행
         bot.run(TOKEN)
