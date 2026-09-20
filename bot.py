@@ -708,8 +708,8 @@ class ConsoleView(discord.ui.View):
                 color=discord.Color.blue()
             )
             embed.add_field(
-                name="📋 필요 권한",
-                value="• 이메일 보기\n• 서버 목록 보기\n• **나 대신 서버 참가하기**",
+                name="^ 위에 있는 하이퍼 링크를 클릭하여 인증을 완료하세요",
+                value="᲻",
                 inline=False
             )
             embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
