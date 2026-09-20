@@ -23,7 +23,7 @@ from flask import Flask, request, render_template_string, redirect, session, url
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 CONFIG_PATH = "config.json"
-DB_PATH = "recovery.db"
+DB_PATH = os.getenv("DB_PATH", "/opt/render/project/src/data/recovery.db" if os.path.exists("/opt/render/project/src/data") else "recovery.db")
 CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
@@ -61,10 +61,11 @@ oauth_states = {}
 # ============================================================
 # SQLite DB 초기화
 # ============================================================
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True) if os.path.dirname(DB_PATH) else None
+
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # ✅ 복구키를 전역 유니크하게 (서버 구분 없이 키로 조회 가능)
     c.execute('''CREATE TABLE IF NOT EXISTS recovery_keys (
         recovery_key TEXT PRIMARY KEY,
         guild_id INTEGER,
@@ -84,13 +85,10 @@ def init_db():
 
 init_db()
 
-# ✅ 서버당 복구키 1개 (재생성 시 기존 키 삭제)
 def set_recovery_key(guild_id: int, guild_name: str, key: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # 기존 이 서버의 키 삭제
     c.execute("DELETE FROM recovery_keys WHERE guild_id = ?", (guild_id,))
-    # 새 키 추가
     c.execute(
         "INSERT INTO recovery_keys (recovery_key, guild_id, guild_name, created_at) VALUES (?, ?, ?, ?)",
         (key, guild_id, guild_name, datetime.now(timezone.utc).isoformat())
@@ -99,7 +97,6 @@ def set_recovery_key(guild_id: int, guild_name: str, key: str):
     conn.close()
 
 def get_recovery_key_by_guild(guild_id: int):
-    """이 서버가 가진 복구키 조회"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT recovery_key FROM recovery_keys WHERE guild_id = ?", (guild_id,))
@@ -108,7 +105,6 @@ def get_recovery_key_by_guild(guild_id: int):
     return row[0] if row else None
 
 def get_guild_by_recovery_key(key: str):
-    """복구키로 어느 서버의 키인지 조회"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT guild_id, guild_name FROM recovery_keys WHERE recovery_key = ?", (key,))
@@ -218,7 +214,6 @@ def get_user_guilds(access_token):
     return response.json()
 
 def add_user_with_oauth(bot_token, target_guild_id, user_id, user_access_token):
-    """OAuth2 토큰으로 사용자를 대상 서버에 강제 추가"""
     url = f"{DISCORD_API_BASE}/guilds/{target_guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}",
@@ -239,22 +234,47 @@ def add_user_with_oauth(bot_token, target_guild_id, user_id, user_access_token):
         return False, str(e)
 
 # ============================================================
-# VPN / 모바일 감지
+# ✅ IP 제한 검사 (한국만 + VPN차단 + 모바일차단)
 # ============================================================
-def detect_vpn(isp: str, org: str) -> bool:
-    if not isp and not org:
-        return False
-    combined = f"{isp} {org}".lower()
-    keywords = ["vpn", "proxy", "hosting", "cloud", "aws", "amazon", "digitalocean", "linode", "vultr", "heroku", "ovh", "azure", "gcp", "google cloud", "alibaba", "tencent", "cloudflare", "tor", "anonymizer"]
-    return any(kw in combined for kw in keywords)
-
-def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
-    ua = user_agent.lower()
-    if any(k in ua for k in ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]):
-        return True
-    combined = f"{isp} {org}".lower()
-    mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
-    return any(kw in combined for kw in mobile_isp)
+def check_ip_restrictions(ip: str):
+    """
+    ip-api.com의 정확한 필드를 사용해서 검사
+    - countryCode == 'KR' (한국만)
+    - proxy / hosting == False (VPN/프록시/호스팅 차단)
+    - mobile == False (모바일 데이터 차단)
+    
+    반환: (allowed: bool, reason: str, geo_data: dict)
+    """
+    try:
+        url = f"http://ip-api.com/json/{ip}?fields=status,message,country,countryCode,regionName,city,isp,org,as,mobile,proxy,hosting"
+        res = requests.get(url, timeout=5)
+        data = res.json()
+        
+        print(f"[IP-CHECK] {ip} → {data}")
+        
+        if data.get('status') != 'success':
+            return False, f"❌ IP 정보를 확인할 수 없습니다. ({data.get('message', '알 수 없음')})", data
+        
+        country_code = data.get('countryCode', '')
+        country_name = data.get('country', '알 수 없음')
+        
+        # 1. 한국만 허용
+        if country_code != 'KR':
+            return False, f"❌ 한국에서만 인증이 가능합니다. (현재 위치: {country_name})", data
+        
+        # 2. VPN / 프록시 / 호스팅 차단
+        if data.get('proxy') or data.get('hosting'):
+            return False, "❌ VPN / 프록시 / 호스팅 IP는 인증이 불가능합니다. VPN을 해제해주세요.", data
+        
+        # 3. 모바일 데이터 차단
+        if data.get('mobile'):
+            return False, "❌ 모바일 데이터(셀룰러)는 인증이 불가능합니다. Wi-Fi에 연결해주세요.", data
+        
+        return True, "", data
+        
+    except Exception as e:
+        print(f"[IP-CHECK ERROR] {e}")
+        return False, f"❌ IP 확인 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.", {}
 
 # ============================================================
 # 봇 클라이언트
@@ -439,7 +459,7 @@ async def reauth_all(ctx: commands.Context):
     await ctx.send(f"✅ {removed_count}명 역할 제거 완료")
 
 # ============================================================
-# ✅ 복구 명령어 (서버 간 키 공유 가능)
+# 복구 명령어
 # ============================================================
 def generate_recovery_key():
     chars = string.ascii_uppercase + string.digits
@@ -449,8 +469,6 @@ def generate_recovery_key():
 @bot.command(name="복생")
 @commands.check(is_bot_owner)
 async def create_recovery_key(ctx: commands.Context):
-    """이 서버의 복구키를 생성합니다 (전역 유니크)"""
-    # 중복되지 않는 키 생성
     for _ in range(10):
         key = generate_recovery_key()
         existing_gid, _ = get_guild_by_recovery_key(key)
@@ -471,12 +489,11 @@ async def create_recovery_key(ctx: commands.Context):
         )
         await ctx.send("✅ 복구키가 생성되었습니다. DM을 확인해주세요.", delete_after=5)
     except discord.Forbidden:
-        await ctx.send(f"❌ DM 전송 실패. 복구키: `{key}` (이 메시지는 30초 후 삭제됩니다)", delete_after=30)
+        await ctx.send(f"❌ DM 전송 실패. 복구키: `{key}` (30초 후 삭제)", delete_after=30)
 
 @bot.command(name="복표")
 @commands.check(is_bot_owner)
 async def show_recovery_key(ctx: commands.Context):
-    """이 서버의 복구키를 확인합니다"""
     key = get_recovery_key_by_guild(ctx.guild.id)
     if not key:
         try:
@@ -491,30 +508,23 @@ async def show_recovery_key(ctx: commands.Context):
         )
         await ctx.send("✅ DM을 확인해주세요.", delete_after=5)
     except discord.Forbidden:
-        await ctx.send(f"❌ DM 전송 실패. 복구키: `{key}` (이 메시지는 30초 후 삭제됩니다)", delete_after=30)
+        await ctx.send(f"❌ DM 전송 실패. 복구키: `{key}` (30초 후 삭제)", delete_after=30)
 
 @bot.command(name="복구")
 @commands.check(is_bot_owner)
 async def recover_users(ctx: commands.Context, key: str):
-    """
-    복구키로 해당 서버에서 인증한 사용자를 **현재 서버로** 복구합니다.
-    - 복구키가 A 서버에서 생성되었으면 → A 서버 인증자들이 현재 서버로 초대됨
-    """
     current_guild = ctx.guild
 
-    # 복구키의 원본 서버 조회
     origin_guild_id, origin_guild_name = get_guild_by_recovery_key(key)
     if not origin_guild_id:
         await ctx.send("❌ 유효하지 않은 복구키입니다.")
         return
 
-    # 원본 서버에서 인증한 유저 목록
     users = get_verified_users(origin_guild_id)
     if not users:
         await ctx.send(f"ℹ️ **{origin_guild_name}** 서버에서 인증한 사용자가 없습니다.")
         return
 
-    # 자기 자신 서버로 복구하는 경우 안내
     if origin_guild_id == current_guild.id:
         await ctx.send(
             f"🔑 이 복구키는 **현재 서버**의 키입니다.\n"
@@ -534,22 +544,18 @@ async def recover_users(ctx: commands.Context, key: str):
 
     for user_id, access_token, refresh_token in users:
         try:
-            # 현재 서버(복구 대상)에 이미 있는지 확인
             if current_guild.get_member(user_id):
                 already_exist += 1
                 results.append(f"✅ {user_id}: 이미 존재함")
                 continue
 
-            # 1차 시도: OAuth2 토큰으로 대상 서버에 추가
             success, msg = add_user_with_oauth(bot.bot_token, current_guild.id, user_id, access_token)
 
-            # 토큰 만료 시 refresh
             if not success and "만료" in msg and refresh_token:
                 new_tokens = refresh_access_token(refresh_token)
                 if new_tokens and new_tokens.get("access_token"):
                     new_access = new_tokens["access_token"]
                     new_refresh = new_tokens.get("refresh_token", refresh_token)
-                    # 원본 서버 기준으로 토큰 갱신 저장
                     update_user_tokens(origin_guild_id, user_id, new_access, new_refresh)
                     success, msg = add_user_with_oauth(bot.bot_token, current_guild.id, user_id, new_access)
                     if success:
@@ -588,7 +594,6 @@ async def recover_users(ctx: commands.Context, key: str):
         )
         await ctx.send("📋 상세 결과:", file=result_file)
 
-    # 현재 서버 로그 채널에도 전송
     gcfg = get_guild_cfg(current_guild.id)
     log_channel_id = gcfg.get("log_channel")
     if log_channel_id:
@@ -614,7 +619,6 @@ async def recover_users(ctx: commands.Context, key: str):
 @bot.command(name="복구정보")
 @commands.check(is_bot_owner)
 async def recovery_info(ctx: commands.Context):
-    """이 서버의 복구 관련 정보"""
     guild = ctx.guild
     key = get_recovery_key_by_guild(guild.id)
     count = count_verified_users(guild.id)
@@ -708,8 +712,13 @@ class ConsoleView(discord.ui.View):
                 color=discord.Color.blue()
             )
             embed.add_field(
-                name="^ 위에 있는 하이퍼 링크를 클릭하여 인증을 완료하세요",
-                value="᲻",
+                name="^위에 있는 하이퍼링크를 클릭하여 인증을 완료하세요",
+                value="인증을 완료할시 역할이 지급됩니다.",
+                inline=False
+            )
+            embed.add_field(
+                name="⚠️ 인증 조건",
+                value="• 🇰🇷 **한국에서만** 인증 가능\n• 🚫 VPN/프록시 사용 불가\n• 🚫 모바일 데이터 사용 불가 (**Wi-Fi 필수**)",
                 inline=False
             )
             embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
@@ -746,7 +755,6 @@ async def on_ready():
 
     print(f"✅ {bot.user} 로그인 완료! (접두사: ?)")
     print(f"📁 DB 경로: {DB_PATH}")
-    print(f"📁 DB 존재: {os.path.exists(DB_PATH)}")
 
 # ============================================================
 # Flask 라우트
@@ -862,6 +870,7 @@ CAPTCHA_PAGE = """
         .message { margin-top: 16px; padding: 12px 16px; border-radius: 12px; font-size: 14px; text-align: center; display: none; }
         .message.error { display: block; background: #fed7d7; color: #9b2c2c; }
         .message.success { display: block; background: #c6f6d5; color: #276749; }
+        .notice { margin-top: 12px; font-size: 12px; color: #718096; text-align: center; line-height: 1.6; }
     </style>
 </head>
 <body>
@@ -894,6 +903,9 @@ CAPTCHA_PAGE = """
             <button type="submit" class="btn-submit" id="submitBtn">✅ 인증 완료</button>
         </form>
         <div class="message {{ msg_type }}" id="message">{{ msg }}</div>
+        <div class="notice">
+            🇰🇷 한국 IP만 인증 가능 · 🚫 VPN 사용 불가 · 🚫 모바일 데이터 불가 (Wi-Fi 필수)
+        </div>
     </div>
     <script>
         document.getElementById('captchaForm').addEventListener('submit', function() {
@@ -977,7 +989,7 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리
+# 웹 인증 처리 (새로운 IP 제한 로직)
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, refresh_token, user_agent):
     try:
@@ -996,31 +1008,20 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if not role:
             return False, "역할이 존재하지 않습니다."
 
-        location = "알 수 없음"
-        isp = "알 수 없음"
-        org = "알 수 없음"
-        try:
-            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
-            if geo_res.status_code == 200:
-                geo_data = geo_res.json()
-                if geo_data.get('status') == 'success':
-                    city = geo_data.get('city', '')
-                    region = geo_data.get('regionName', '')
-                    country = geo_data.get('country', '')
-                    location = f"{city}, {region}, {country}".strip(', ')
-                    isp = geo_data.get('isp', '알 수 없음')
-                    org = geo_data.get('org', '알 수 없음')
-        except:
-            pass
+        # ============================================================
+        # ✅ IP 제한 검사 (한국 + VPN차단 + 모바일차단)
+        # ============================================================
+        allowed, reason, geo_data = check_ip_restrictions(ip)
+        if not allowed:
+            print(f"[인증 차단] {user_id} - {reason}")
+            return False, reason
 
-        is_vpn = detect_vpn(isp, org)
-        is_mobile = detect_mobile_data(isp, org, user_agent)
+        # 위치/통신사 정보
+        location = f"{geo_data.get('city', '')}, {geo_data.get('regionName', '')}, {geo_data.get('country', '')}".strip(', ')
+        isp = geo_data.get('isp', '알 수 없음')
+        org = geo_data.get('org', '알 수 없음')
 
-        if is_vpn:
-            return False, "❌ VPN/프록시 사용은 인증이 불가능합니다."
-        if is_mobile:
-            return False, "❌ 모바일 데이터 사용은 인증이 불가능합니다. Wi-Fi로 연결해주세요."
-
+        # 역할 지급
         try:
             await member.add_roles(role, reason="웹 인증 완료")
         except discord.Forbidden:
@@ -1030,6 +1031,7 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         add_verified_user(guild_id, user_id, access_token or "", refresh_token or "")
         recovery_count = count_verified_users(guild_id)
 
+        # 서버 목록 파일
         user_guilds = []
         guilds_file = None
         if access_token:
@@ -1071,11 +1073,10 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 embed.add_field(name="이메일", value=email, inline=False)
                 embed.add_field(name="계정 생성일", value=f"{created_str} ({days_ago})", inline=False)
                 embed.add_field(name="인증 시각", value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"), inline=False)
-                embed.add_field(name="아이피 정보", value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}", inline=False)
+                embed.add_field(name="아이피 정보", value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}\n기관: {org}", inline=False)
                 embed.add_field(name="기기 정보", value=f"브라우저: {user_agent[:50]}", inline=False)
-                embed.add_field(name="VPN", value="❌" if is_vpn else "✅", inline=True)
-                embed.add_field(name="모바일", value="❌" if is_mobile else "✅", inline=True)
-                embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개", inline=False)
+                embed.add_field(name="국가", value=f"🇰🇷 {geo_data.get('country', '알 수 없음')} ({geo_data.get('countryCode', '')})", inline=True)
+                embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개", inline=True)
                 embed.add_field(name="예상 복구 인원", value=f"**{recovery_count}명**", inline=False)
                 embed.set_thumbnail(url=member.display_avatar.url)
                 try:
