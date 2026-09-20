@@ -13,17 +13,18 @@ import re
 import aiohttp
 import urllib.parse
 import io
-import socket
-import base64
+import sqlite3
 from datetime import datetime, timezone, timedelta
-from flask import Flask, request, render_template_string, redirect, session, url_for, jsonify, Response
+from flask import Flask, request, render_template_string, redirect, session, url_for
 
 # ============================================================
-# 공통 설정
+# 공통 설정 (환경변수)
 # ============================================================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
 CONFIG_PATH = "config.json"
+DB_PATH = "recovery.db"
+CAPTCHA_EXPIRE_SECONDS = 600
 CONSOLE_BUTTON_ID = "verify_console_open_button"
 KST = timezone(timedelta(hours=9))
 
@@ -37,29 +38,12 @@ DISCORD_OAUTH2_URL = "https://discord.com/api/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
-ALLOWED_USER_IDS = [1379356844920799255]
+ALLOWED_USER_IDS = [
+    1379356844920799255,
+]
 
 WEB_HOST = "0.0.0.0"
-WEB_PORT = int(os.getenv("PORT", 5000))
-
-POWER_PASSWORD = os.getenv("POWER_PASSWORD", "6254")
-AGENT_TOKEN = os.getenv("AGENT_TOKEN", "change-this-agent-token")
-WOL_TARGET = os.getenv("WOL_TARGET", "")
-WOL_MAC = os.getenv("WOL_MAC", "")
-WOL_PORT = int(os.getenv("WOL_PORT", 9))
-
-def send_magic_packet(mac_address, target, port=9):
-    mac_clean = mac_address.replace(":", "").replace("-", "").strip()
-    if len(mac_clean) != 12:
-        raise ValueError("MAC 주소 형식 오류")
-    mac_bytes = bytes.fromhex(mac_clean)
-    packet = b'\xff' * 6 + mac_bytes * 16
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    try:
-        sock.sendto(packet, (target, port))
-    finally:
-        sock.close()
+WEB_PORT = 5000
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "".join(random.choices(string.ascii_letters + string.digits, k=32)))
@@ -68,65 +52,102 @@ app.config.update(
     SESSION_COOKIE_SECURE=True,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE='Lax',
-    PERMANENT_SESSION_LIFETIME=timedelta(days=30)
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=24)
 )
 
+pending_verifications_global = {}
 oauth_states = {}
-verified_users = {}
 
 # ============================================================
-# ✅ 설정 로드 (환경변수 오버라이드 → 인증로그 휘발 방지)
+# SQLite DB 초기화
 # ============================================================
-def load_config():
-    cfg = {}
-    if os.path.exists(CONFIG_PATH):
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        except Exception as e:
-            print(f"⚠️ config.json 읽기 실패: {e}")
-            cfg = {}
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS servers (
+        guild_id INTEGER PRIMARY KEY,
+        recovery_key TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS verified_users (
+        guild_id INTEGER,
+        user_id INTEGER,
+        access_token TEXT,
+        refresh_token TEXT,
+        verified_at TEXT,
+        PRIMARY KEY (guild_id, user_id)
+    )''')
+    conn.commit()
+    conn.close()
 
-    env_guild_id = os.getenv("GUILD_ID")
-    if env_guild_id:
-        guild_cfg = cfg.setdefault(str(env_guild_id), {})
-        if os.getenv("LOG_CHANNEL_ID"):
-            try: guild_cfg["log_channel"] = int(os.getenv("LOG_CHANNEL_ID"))
-            except: pass
-        if os.getenv("VERIFY_ROLE_ID"):
-            try: guild_cfg["verify_role"] = int(os.getenv("VERIFY_ROLE_ID"))
-            except: pass
-        if os.getenv("MAIN_CATEGORY_ID"):
-            try: guild_cfg["main_category_id"] = int(os.getenv("MAIN_CATEGORY_ID"))
-            except: pass
-        if os.getenv("ALLOWED_ROLE_ID"):
-            try: guild_cfg["allowed_role_id"] = int(os.getenv("ALLOWED_ROLE_ID"))
-            except: pass
-    return cfg
+init_db()
 
-def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print(f"⚠️ config.json 저장 실패: {e}")
+def set_recovery_key(guild_id: int, key: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO servers (guild_id, recovery_key) VALUES (?, ?)", (guild_id, key))
+    conn.commit()
+    conn.close()
 
-config = load_config()
+def get_recovery_key(guild_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT recovery_key FROM servers WHERE guild_id = ?", (guild_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else None
 
-def get_guild_cfg(guild_id: int) -> dict:
-    return config.setdefault(str(guild_id), {})
+def add_verified_user(guild_id: int, user_id: int, access_token: str, refresh_token: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR REPLACE INTO verified_users (guild_id, user_id, access_token, refresh_token, verified_at) VALUES (?, ?, ?, ?, ?)",
+        (guild_id, user_id, access_token, refresh_token, datetime.now(timezone.utc).isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def get_verified_users(guild_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT user_id, access_token, refresh_token FROM verified_users WHERE guild_id = ?", (guild_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def count_verified_users(guild_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM verified_users WHERE guild_id = ?", (guild_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 0
+
+def update_user_tokens(guild_id: int, user_id: int, access_token: str, refresh_token: str):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "UPDATE verified_users SET access_token = ?, refresh_token = ? WHERE guild_id = ? AND user_id = ?",
+        (access_token, refresh_token, guild_id, user_id)
+    )
+    conn.commit()
+    conn.close()
 
 # ============================================================
 # OAuth2 헬퍼
 # ============================================================
 def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
     state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-    oauth_states[state] = {"created_at": time.time(), "guild_id": guild_id, "user_id": user_id, "bot_name": bot_name}
+    oauth_states[state] = {
+        "created_at": time.time(),
+        "guild_id": guild_id,
+        "user_id": user_id,
+        "bot_name": bot_name
+    }
     params = {
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds",
+        "scope": "identify email guilds guilds.join",  # ✅ guilds.join 추가
         "state": state
     }
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -141,31 +162,89 @@ def exchange_code(code):
         "code": code,
         "redirect_uri": DISCORD_REDIRECT_URI
     }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
     try:
-        r = requests.post(DISCORD_TOKEN_URL, data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=10)
-        return r.json()
+        response = requests.post(DISCORD_TOKEN_URL, data=data, headers=headers, timeout=10)
+        return response.json()
     except Exception as e:
         return {"error": "request_failed", "error_description": str(e)}
 
+def refresh_access_token(refresh_token):
+    if not DISCORD_CLIENT_SECRET or not refresh_token:
+        return None
+    data = {
+        "client_id": DISCORD_CLIENT_ID,
+        "client_secret": DISCORD_CLIENT_SECRET,
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    try:
+        response = requests.post(DISCORD_TOKEN_URL, data=data, headers=headers, timeout=10)
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except:
+        return None
+
 def get_discord_user(access_token):
-    return requests.get(f"{DISCORD_API_BASE}/users/@me",
-        headers={"Authorization": f"Bearer {access_token}"}).json()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(f"{DISCORD_API_BASE}/users/@me", headers=headers)
+    return response.json()
 
 def get_user_guilds(access_token):
-    return requests.get(f"{DISCORD_API_BASE}/users/@me/guilds",
-        headers={"Authorization": f"Bearer {access_token}"}).json()
+    headers = {"Authorization": f"Bearer {access_token}"}
+    response = requests.get(f"{DISCORD_API_BASE}/users/@me/guilds", headers=headers)
+    return response.json()
 
-def detect_vpn(isp, org):
-    if not isp and not org: return False
-    c = f"{isp} {org}".lower()
-    kws = ["vpn","proxy","hosting","cloud","aws","amazon","digitalocean","linode",
-           "vultr","heroku","ovh","azure","gcp","google cloud","alibaba","tencent",
-           "cloudflare","tor","anonymizer"]
-    return any(k in c for k in kws)
+def add_user_with_oauth(bot_token, guild_id, user_id, user_access_token):
+    """OAuth2 토큰으로 사용자를 서버에 강제 추가"""
+    url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
+    headers = {
+        "Authorization": f"Bot {bot_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {"access_token": user_access_token}
+    try:
+        response = requests.put(url, headers=headers, json=payload)
+        if response.status_code == 201:
+            return True, "새로 추가됨"
+        elif response.status_code == 204:
+            return True, "이미 존재함"
+        elif response.status_code == 401:
+            return False, "토큰 만료"
+        else:
+            return False, f"HTTP {response.status_code}: {response.text[:200]}"
+    except Exception as e:
+        return False, str(e)
 
 # ============================================================
-# 봇
+# VPN / 모바일 데이터 감지
+# ============================================================
+def detect_vpn(isp: str, org: str) -> bool:
+    if not isp and not org:
+        return False
+    combined = f"{isp} {org}".lower()
+    keywords = ["vpn", "proxy", "hosting", "cloud", "aws", "amazon", "digitalocean", "linode", "vultr", "heroku", "ovh", "azure", "gcp", "google cloud", "alibaba", "tencent", "cloudflare", "tor", "anonymizer"]
+    for kw in keywords:
+        if kw in combined:
+            return True
+    return False
+
+def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
+    ua = user_agent.lower()
+    mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
+    if any(k in ua for k in mobile_ua):
+        return True
+    combined = f"{isp} {org}".lower()
+    mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
+    for kw in mobile_isp:
+        if kw in combined:
+            return True
+    return False
+
+# ============================================================
+# 봇 클라이언트
 # ============================================================
 intents = discord.Intents.default()
 intents.members = True
@@ -176,27 +255,45 @@ bot = commands.Bot(command_prefix="?", intents=intents, help_command=None)
 bot.bot_token = TOKEN
 bot.custom_console_button_id = "verify_console_authbot"
 
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+def save_config(cfg):
+    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+config = load_config()
+
+def get_guild_cfg(guild_id: int) -> dict:
+    return config.setdefault(str(guild_id), {})
+
 def is_authorized(ctx):
-    if ctx.guild and ctx.author.id == ctx.guild.owner_id: return True
-    if ctx.author.id in ALLOWED_USER_IDS: return True
+    if ctx.guild and ctx.author.id == ctx.guild.owner_id:
+        return True
+    if ctx.author.id in ALLOWED_USER_IDS:
+        return True
     cfg = load_config()
-    return ctx.author.id in cfg.get("authorized_users", [])
+    if ctx.author.id in cfg.get("authorized_users", []):
+        return True
+    return False
 
 def is_bot_owner(ctx):
     return ctx.author.id in ALLOWED_USER_IDS
 
+# ============================================================
+# 명령어
+# ============================================================
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ 권한 없음")
+        await ctx.send("❌ 이 명령어는 서버 소유자 또는 허용된 사용자만 사용할 수 있어요.")
     elif isinstance(error, commands.NoPrivateMessage):
-        await ctx.send("❌ 서버 전용")
-    elif isinstance(error, commands.RoleNotFound):
-        await ctx.send("❌ 역할 없음")
-    elif isinstance(error, commands.ChannelNotFound):
-        await ctx.send("❌ 채널 없음")
+        await ctx.send("❌ 이 명령어는 서버 안에서만 사용할 수 있어요.")
     elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send("❌ 값 빠짐")
+        await ctx.send("❌ 필요한 값이 빠졌어요.")
     else:
         traceback.print_exc()
         await ctx.send(f"❌ 오류: {str(error)}")
@@ -205,45 +302,47 @@ async def on_command_error(ctx, error):
 @commands.check(is_bot_owner)
 async def register_user(ctx, member: discord.Member):
     cfg = load_config()
-    if "authorized_users" not in cfg: cfg["authorized_users"] = []
+    if "authorized_users" not in cfg:
+        cfg["authorized_users"] = []
     if member.id not in cfg["authorized_users"]:
         cfg["authorized_users"].append(member.id)
         save_config(cfg)
-        await ctx.send(f"✅ {member.mention} 등록 완료")
+        await ctx.send(f"✅ {member.mention} 님이 명령어 권한을 얻었습니다.")
     else:
-        await ctx.send(f"⚠️ 이미 등록됨")
+        await ctx.send(f"⚠️ 이미 등록되어 있습니다.")
 
 @bot.command(name="인증역할")
 @commands.check(is_authorized)
-async def set_verify_role(ctx, role: discord.Role):
+async def set_verify_role(ctx: commands.Context, role: discord.Role):
     gcfg = get_guild_cfg(ctx.guild.id)
     gcfg["verify_role"] = role.id
     save_config(config)
-    await ctx.send(f"✅ 인증 역할 {role.mention}\n💡 Render 유지: `VERIFY_ROLE_ID={role.id}`, `GUILD_ID={ctx.guild.id}`")
+    await ctx.send(f"✅ 인증 역할: {role.mention}")
 
 @bot.command(name="로그채널")
 @commands.check(is_authorized)
-async def set_log_channel(ctx, channel: discord.TextChannel):
+async def set_log_channel(ctx: commands.Context, channel: discord.TextChannel):
     gcfg = get_guild_cfg(ctx.guild.id)
     gcfg["log_channel"] = channel.id
     save_config(config)
-    await ctx.send(f"✅ 로그 채널 {channel.mention}\n💡 Render 유지: `LOG_CHANNEL_ID={channel.id}`, `GUILD_ID={ctx.guild.id}`")
+    await ctx.send(f"✅ 로그 채널: {channel.mention}")
 
 @bot.command(name="인증채널")
 @commands.check(is_authorized)
 async def set_auth_channel(ctx, *, args: str):
-    m = re.search(r'<@&(\d+)>', args)
-    if not m:
-        await ctx.send("❌ 사용법: `?인증채널 카테고리이름 @역할`")
+    role_match = re.search(r'<@&(\d+)>', args)
+    if not role_match:
+        await ctx.send("❌ 예: `?인증채널 카테고리이름 @역할`")
         return
-    role = ctx.guild.get_role(int(m.group(1)))
+    role_id = int(role_match.group(1))
+    role = ctx.guild.get_role(role_id)
     if not role:
-        await ctx.send("❌ 역할 없음")
+        await ctx.send("❌ 역할을 찾을 수 없어요.")
         return
-    cat_name = args.replace(m.group(0), '').strip()
-    category = discord.utils.get(ctx.guild.categories, name=cat_name)
+    category_name = args.replace(role_match.group(0), '').strip()
+    category = discord.utils.get(ctx.guild.categories, name=category_name)
     if not category:
-        await ctx.send(f"❌ '{cat_name}' 카테고리 없음")
+        await ctx.send(f"❌ '{category_name}' 카테고리를 찾을 수 없어요.")
         return
     gcfg = get_guild_cfg(ctx.guild.id)
     gcfg["main_category_id"] = category.id
@@ -259,883 +358,397 @@ async def set_auth_channel(ctx, *, args: str):
 async def set_exception_channel(ctx, *, category_name: str):
     category = discord.utils.get(ctx.guild.categories, name=category_name)
     if not category:
-        await ctx.send(f"❌ '{category_name}' 없음")
+        await ctx.send(f"❌ 카테고리를 찾을 수 없어요.")
         return
     gcfg = get_guild_cfg(ctx.guild.id)
     if "exception_category_ids" not in gcfg:
         gcfg["exception_category_ids"] = []
     if category.id in gcfg["exception_category_ids"]:
-        await ctx.send("⚠️ 이미 등록됨")
+        await ctx.send("⚠️ 이미 등록된 예외 카테고리입니다.")
         return
     gcfg["exception_category_ids"].append(category.id)
     save_config(config)
-    r_id = gcfg.get("allowed_role_id")
-    role = ctx.guild.get_role(r_id) if r_id else None
-    if not role:
-        await ctx.send("❌ 먼저 `?인증채널`")
+    allowed_role_id = gcfg.get("allowed_role_id")
+    if not allowed_role_id:
+        await ctx.send("❌ 먼저 `?인증채널`로 설정해주세요.")
         return
-    for ch in category.channels:
-        if isinstance(ch, discord.TextChannel):
+    role = ctx.guild.get_role(allowed_role_id)
+    if not role:
+        await ctx.send("❌ 역할을 찾을 수 없어요.")
+        return
+    for channel in category.channels:
+        if isinstance(channel, discord.TextChannel):
             try:
-                ow = ch.overwrites_for(role)
-                ow.view_channel = True
-                ow.send_messages = False
-                await ch.set_permissions(role, overwrite=ow)
-            except: pass
-    await ctx.send(f"✅ '{category.name}' 제한 완료")
+                overwrite = channel.overwrites_for(role)
+                overwrite.view_channel = True
+                overwrite.send_messages = False
+                await channel.set_permissions(role, overwrite=overwrite)
+            except:
+                pass
+    await ctx.send(f"✅ '{category.name}' 채팅 제한 완료")
 
 @bot.command(name="콘솔생성")
 @commands.check(is_authorized)
-async def create_console(ctx):
-    embed = discord.Embed(title="🔐 서버 인증",
-        description="아래 버튼을 눌러 **디스코드로 로그인**하세요.",
-        color=discord.Color.blurple())
-    await ctx.send(embed=embed, view=ConsoleView(bot.custom_console_button_id))
+async def create_console(ctx: commands.Context):
+    embed = discord.Embed(
+        title="🔐 서버 인증",
+        description="아래 버튼을 눌러 **디스코드로 로그인**하고 인증을 완료하세요.",
+        color=discord.Color.blurple()
+    )
+    view = ConsoleView(bot.custom_console_button_id)
+    await ctx.send(embed=embed, view=view)
 
 @bot.command(name="재인증")
 @commands.check(is_bot_owner)
-async def reauth_all(ctx):
-    gcfg = get_guild_cfg(ctx.guild.id)
-    r_id = gcfg.get("verify_role")
-    if not r_id:
-        await ctx.send("❌ 인증 역할 미설정")
+async def reauth_all(ctx: commands.Context):
+    guild = ctx.guild
+    gcfg = get_guild_cfg(guild.id)
+    verify_role_id = gcfg.get("verify_role")
+    if not verify_role_id:
+        await ctx.send("❌ 인증 역할이 설정되지 않았습니다.")
         return
-    role = ctx.guild.get_role(r_id)
+    role = guild.get_role(verify_role_id)
     if not role:
-        await ctx.send("❌ 역할 없음")
+        await ctx.send("❌ 역할이 존재하지 않습니다.")
         return
-    members = [m for m in ctx.guild.members if role in m.roles]
-    if not members:
-        await ctx.send("ℹ️ 대상 없음")
+    members_with_role = [m for m in guild.members if role in m.roles]
+    if not members_with_role:
+        await ctx.send("ℹ️ 인증 역할을 가진 사용자가 없습니다.")
         return
-    await ctx.send(f"🔄 {len(members)}명 제거 중...")
-    cnt = 0
-    for m in members:
+    removed_count = 0
+    for member in members_with_role:
         try:
-            await m.remove_roles(role, reason="재인증")
-            cnt += 1
+            await member.remove_roles(role, reason="재인증")
+            removed_count += 1
             await asyncio.sleep(0.5)
-        except: pass
-    await ctx.send(f"✅ {cnt}명 제거 완료")
+        except:
+            pass
+    await ctx.send(f"✅ {removed_count}명 역할 제거 완료")
 
-@bot.command(name="로그테스트")
-@commands.check(is_authorized)
-async def test_log(ctx):
-    gcfg = get_guild_cfg(ctx.guild.id)
-    lc_id = gcfg.get("log_channel")
-    if not lc_id:
-        await ctx.send("❌ 로그 채널 미설정")
-        return
-    lc = ctx.guild.get_channel(lc_id)
-    if not lc:
-        await ctx.send(f"❌ 채널(ID={lc_id}) 없음")
+# ============================================================
+# ✅ 복구 관련 명령어
+# ============================================================
+def generate_recovery_key():
+    """복구키 생성 (예: ABCD-1234-EFGH)"""
+    chars = string.ascii_uppercase + string.digits
+    parts = [''.join(random.choices(chars, k=4)) for _ in range(3)]
+    return "-".join(parts)
+
+@bot.command(name="복생")
+@commands.check(is_bot_owner)
+async def create_recovery_key(ctx: commands.Context):
+    """이 서버의 복구키를 생성합니다 (봇 소유자에게만 DM)"""
+    key = generate_recovery_key()
+    set_recovery_key(ctx.guild.id, key)
+    try:
+        await ctx.author.send(
+            f"🔑 **{ctx.guild.name}** 서버의 복구키가 생성되었습니다.\n"
+            f"복구키: `{key}`\n\n"
+            f"이 키를 잃어버리면 서버 복구가 불가능합니다. 안전한 곳에 보관하세요."
+        )
+        await ctx.send("✅ 복구키가 생성되었습니다. DM을 확인해주세요.", delete_after=5)
+    except discord.Forbidden:
+        await ctx.send("❌ DM을 보낼 수 없습니다. 개인정보 설정을 확인해주세요.")
+
+@bot.command(name="복표")
+@commands.check(is_bot_owner)
+async def show_recovery_key(ctx: commands.Context):
+    """이 서버의 복구키를 확인합니다 (봇 소유자에게만 DM)"""
+    key = get_recovery_key(ctx.guild.id)
+    if not key:
+        try:
+            await ctx.author.send("❌ 아직 복구키가 생성되지 않았습니다. `?복생`으로 생성하세요.")
+        except:
+            pass
         return
     try:
-        await lc.send(embed=discord.Embed(title="🧪 로그 테스트",
-            description="정상 작동 중", color=discord.Color.blue(),
-            timestamp=datetime.now(timezone.utc)))
-        await ctx.send(f"✅ {lc.mention} 전송됨")
+        await ctx.author.send(
+            f"🔑 **{ctx.guild.name}** 서버의 복구키입니다.\n"
+            f"복구키: `{key}`"
+        )
+        await ctx.send("✅ DM을 확인해주세요.", delete_after=5)
     except discord.Forbidden:
-        await ctx.send(f"❌ {lc.mention} 권한 부족")
-    except Exception as e:
-        await ctx.send(f"❌ 실패: {e}")
+        await ctx.send("❌ DM을 보낼 수 없습니다.")
+
+@bot.command(name="복구")
+@commands.check(is_bot_owner)
+async def recover_users(ctx: commands.Context, key: str):
+    """복구키로 이 서버에서 인증한 사용자를 복구합니다"""
+    guild = ctx.guild
+    stored_key = get_recovery_key(guild.id)
+    if not stored_key:
+        await ctx.send("❌ 이 서버에 복구키가 설정되지 않았습니다. `?복생`으로 생성하세요.")
+        return
+    if stored_key != key:
+        await ctx.send("❌ 복구키가 일치하지 않습니다.")
+        return
+
+    users = get_verified_users(guild.id)
+    if not users:
+        await ctx.send("ℹ️ 이 서버에서 인증한 사용자가 없습니다.")
+        return
+
+    await ctx.send(f"🔄 이 서버에서 인증한 **{len(users)}명**의 복구를 시작합니다...")
+
+    added_new = 0
+    already_exist = 0
+    failed = 0
+    token_refreshed = 0
+    results = []
+
+    for user_id, access_token, refresh_token in users:
+        try:
+            # 이미 서버에 있는지 확인
+            if guild.get_member(user_id):
+                already_exist += 1
+                results.append(f"✅ {user_id}: 이미 존재함")
+                continue
+
+            # 1차 시도
+            success, msg = add_user_with_oauth(bot.bot_token, guild.id, user_id, access_token)
+
+            # 토큰 만료 시 refresh
+            if not success and "만료" in msg and refresh_token:
+                new_tokens = refresh_access_token(refresh_token)
+                if new_tokens and new_tokens.get("access_token"):
+                    new_access = new_tokens["access_token"]
+                    new_refresh = new_tokens.get("refresh_token", refresh_token)
+                    update_user_tokens(guild.id, user_id, new_access, new_refresh)
+                    success, msg = add_user_with_oauth(bot.bot_token, guild.id, user_id, new_access)
+                    if success:
+                        token_refreshed += 1
+
+            if success:
+                if "새로" in msg:
+                    added_new += 1
+                    results.append(f"✅ {user_id}: 새로 추가됨")
+                else:
+                    already_exist += 1
+                    results.append(f"ℹ️ {user_id}: 이미 존재함")
+            else:
+                failed += 1
+                results.append(f"❌ {user_id}: {msg}")
+
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            failed += 1
+            results.append(f"❌ {user_id}: 예외 - {str(e)}")
+
+    summary = (
+        f"✅ **복구 완료!**\n"
+        f"• 새로 추가: {added_new}명\n"
+        f"• 이미 존재: {already_exist}명\n"
+        f"• 실패: {failed}명\n"
+        f"• 토큰 자동 갱신: {token_refreshed}명"
+    )
+    await ctx.send(summary)
+
+    if results:
+        result_text = "\n".join(results)
+        result_file = discord.File(
+            io.BytesIO(result_text.encode('utf-8')),
+            filename=f"복구결과_{int(time.time())}.txt"
+        )
+        await ctx.send("📋 상세 결과:", file=result_file)
+
+    # 로그 채널에도 전송
+    gcfg = get_guild_cfg(guild.id)
+    log_channel_id = gcfg.get("log_channel")
+    if log_channel_id:
+        log_channel = guild.get_channel(log_channel_id)
+        if log_channel:
+            embed = discord.Embed(
+                title="📨 복구 실행됨",
+                description=f"복구키로 이 서버 인증자 복구 완료",
+                color=discord.Color.blue(),
+                timestamp=datetime.now(timezone.utc)
+            )
+            embed.add_field(name="실행자", value=ctx.author.mention, inline=False)
+            embed.add_field(name="새로 추가", value=str(added_new), inline=True)
+            embed.add_field(name="이미 존재", value=str(already_exist), inline=True)
+            embed.add_field(name="실패", value=str(failed), inline=True)
+            try:
+                await log_channel.send(embed=embed)
+            except:
+                pass
+
+@bot.command(name="복구정보")
+@commands.check(is_bot_owner)
+async def recovery_info(ctx: commands.Context):
+    """이 서버의 복구 관련 정보를 확인합니다"""
+    guild = ctx.guild
+    key = get_recovery_key(guild.id)
+    count = count_verified_users(guild.id)
+
+    embed = discord.Embed(
+        title="🔑 복구 정보",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(timezone.utc)
+    )
+    embed.add_field(
+        name="복구키",
+        value=f"`{key}`" if key else "❌ 생성되지 않음",
+        inline=False
+    )
+    embed.add_field(
+        name="복구 대상 인원",
+        value=f"{count}명",
+        inline=False
+    )
+    await ctx.send(embed=embed, ephemeral=True)
 
 @bot.command(name="설정확인")
 @commands.check(is_authorized)
-async def check_settings(ctx):
+async def check_config(ctx: commands.Context):
     gcfg = get_guild_cfg(ctx.guild.id)
-    lines = [f"**📋 설정** (Guild: `{ctx.guild.id}`)"]
-    for key, label in [("verify_role","인증역할"),("log_channel","로그채널"),
-                       ("main_category_id","카테고리"),("allowed_role_id","허용역할")]:
-        v = gcfg.get(key)
-        if v:
-            obj = ctx.guild.get_role(v) if "role" in key else ctx.guild.get_channel(v)
-            lines.append(f"• {label}: `{v}` → {obj.mention if obj else '⚠️ 없음'}")
-        else:
-            lines.append(f"• {label}: ❌")
-    await ctx.send("\n".join(lines))
+    verify_role = ctx.guild.get_role(gcfg.get("verify_role")) if gcfg.get("verify_role") else None
+    log_channel = ctx.guild.get_channel(gcfg.get("log_channel")) if gcfg.get("log_channel") else None
 
-async def setup_all_permissions(guild, main_cat_id, role_id, exc_cats):
-    role = guild.get_role(role_id)
-    if not role: return
-    for ch in guild.channels:
-        if ch.id == main_cat_id: continue
-        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel)) and ch.category_id == main_cat_id: continue
-        if ch.id in exc_cats: continue
-        if isinstance(ch, (discord.TextChannel, discord.VoiceChannel)) and ch.category_id in exc_cats: continue
+    embed = discord.Embed(title="⚙️ 서버 설정", color=discord.Color.blue())
+    embed.add_field(name="인증 역할", value=verify_role.mention if verify_role else "❌ 없음", inline=False)
+    embed.add_field(name="로그 채널", value=log_channel.mention if log_channel else "❌ 없음", inline=False)
+    embed.add_field(name="복구키", value=f"`{get_recovery_key(ctx.guild.id) or '미생성'}`", inline=False)
+    embed.add_field(name="복구 인원", value=f"{count_verified_users(ctx.guild.id)}명", inline=False)
+    await ctx.send(embed=embed, ephemeral=True)
+
+# ============================================================
+# 권한 설정 헬퍼
+# ============================================================
+async def setup_all_permissions(guild, main_category_id, allowed_role_id, exception_category_ids):
+    role = guild.get_role(allowed_role_id)
+    if not role:
+        return
+    for channel in guild.channels:
+        if channel.id == main_category_id:
+            continue
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id == main_category_id:
+            continue
+        if channel.id in exception_category_ids:
+            continue
+        if isinstance(channel, (discord.TextChannel, discord.VoiceChannel)) and channel.category_id in exception_category_ids:
+            continue
         try:
-            ow = ch.overwrites_for(role)
-            ow.view_channel = True
-            if isinstance(ch, discord.TextChannel):
-                ow.send_messages = True
-            await ch.set_permissions(role, overwrite=ow)
-        except: pass
+            overwrite = channel.overwrites_for(role)
+            overwrite.view_channel = True
+            if isinstance(channel, discord.TextChannel):
+                overwrite.send_messages = True
+            await channel.set_permissions(role, overwrite=overwrite)
+        except:
+            pass
+    for cat_id in exception_category_ids:
+        cat = guild.get_channel(cat_id)
+        if cat and isinstance(cat, discord.CategoryChannel):
+            for ch in cat.channels:
+                if isinstance(ch, discord.TextChannel):
+                    try:
+                        overwrite = ch.overwrites_for(role)
+                        overwrite.view_channel = True
+                        overwrite.send_messages = False
+                        await ch.set_permissions(role, overwrite=overwrite)
+                    except:
+                        pass
 
+# ============================================================
+# ConsoleView
+# ============================================================
 class ConsoleView(discord.ui.View):
     def __init__(self, custom_id):
         super().__init__(timeout=None)
         self.custom_id = custom_id
 
-    @discord.ui.button(label="🔑 디스코드로 인증하기", style=discord.ButtonStyle.blurple,
-                       emoji="🔐", custom_id=CONSOLE_BUTTON_ID)
-    async def console_verify_button(self, interaction, button):
+    @discord.ui.button(label="🔑 디스코드로 인증하기", style=discord.ButtonStyle.blurple, emoji="🔐", custom_id=CONSOLE_BUTTON_ID)
+    async def console_verify_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         try:
             await interaction.response.defer(ephemeral=True)
             gcfg = get_guild_cfg(interaction.guild_id)
             if not gcfg.get("verify_role"):
-                return await interaction.followup.send("❌ 인증역할 미설정", ephemeral=True)
-            url = generate_oauth2_url(guild_id=interaction.guild_id,
-                user_id=interaction.user.id, bot_name="인증봇")
-            embed = discord.Embed(title="🔐 디스코드 인증",
-                description=f"[디스코드로 로그인하여 인증]({url})",
-                color=discord.Color.blue())
-            embed.set_footer(text="봇이 아님을 인증하면 역할 지급")
-            await interaction.followup.send(embed=embed, ephemeral=True)
-        except Exception:
-            traceback.print_exc()
+                return await interaction.followup.send("❌ 인증 역할이 설정되지 않았어요.", ephemeral=True)
 
+            oauth_url = generate_oauth2_url(
+                guild_id=interaction.guild_id,
+                user_id=interaction.user.id,
+                bot_name="인증봇"
+            )
+
+            embed = discord.Embed(
+                title="🔐 디스코드 인증",
+                description=f"[디스코드로 로그인하여 인증을 완료하세요]({oauth_url})",
+                color=discord.Color.blue()
+            )
+            embed.add_field(
+                name="📋 필요 권한",
+                value="• 이메일 보기\n• 서버 목록 보기\n• **나 대신 서버 참가하기**",
+                inline=False
+            )
+            embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
+            await interaction.followup.send(embed=embed, ephemeral=True)
+        except Exception as e:
+            traceback.print_exc()
+            try:
+                await interaction.followup.send(f"❌ 오류: {str(e)}", ephemeral=True)
+            except:
+                pass
+
+# ============================================================
+# 셀프 핑
+# ============================================================
 @tasks.loop(minutes=10)
 async def keep_alive():
     try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(BASE_URL, timeout=10) as resp:
-                print(f"✅ 셀프 핑 ({resp.status})")
+        async with aiohttp.ClientSession() as session:
+            async with session.get(BASE_URL, timeout=10) as resp:
+                print(f"✅ 셀프 핑 성공! ({resp.status})")
     except Exception as e:
         print(f"⚠️ 셀프 핑 실패: {e}")
 
 @bot.event
 async def on_ready():
     if not hasattr(bot, "console_view_added"):
-        bot.add_view(ConsoleView(bot.custom_console_button_id))
+        view = ConsoleView(bot.custom_console_button_id)
+        bot.add_view(view)
         bot.console_view_added = True
+
     if not hasattr(bot, "keep_alive_started"):
         keep_alive.start()
         bot.keep_alive_started = True
-    print(f"✅ {bot.user} 로그인 완료!")
+
+    print(f"✅ {bot.user} 로그인 완료! (접두사: ?)")
+    print(f"📁 DB 경로: {DB_PATH}")
+    print(f"📁 DB 존재: {os.path.exists(DB_PATH)}")
 
 # ============================================================
-# Flask 기본
+# Flask 라우트
 # ============================================================
 @app.route('/')
 def home():
-    return "✅ alive", 200
+    return "✅ Bot is alive and running!", 200
 
-# ============================================================
-# 🔌 POWER 섹션
-# ============================================================
-shutdown_request = {"requested": False, "requested_at": None}
-pc_status = {"last_heartbeat": 0, "hostname": None, "os": None,
-             "screen_width": 0, "screen_height": 0}
-
-frame_lock = threading.Lock()
-frame_store = {"data": None, "id": 0, "updated_at": 0}
-frame_count = {"total": 0}          # 디버그용
-input_lock = threading.Lock()
-input_queue = []
-desktop_session = {"last_ping": 0}
-
-POWER_LOGIN_PAGE = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🔐 로그인</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; }
-  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-    min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; color:#eee; }
-  .box { background:rgba(255,255,255,0.08); backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,0.1); border-radius:24px; padding:40px 30px;
-    max-width:380px; width:100%; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
-  .box h1 { font-size:22px; margin-bottom:8px; font-weight:700; }
-  .box p { font-size:14px; color:#a0aec0; margin-bottom:28px; }
-  input { width:100%; padding:16px; font-size:22px; letter-spacing:8px; text-align:center;
-    background:rgba(0,0,0,0.3); border:2px solid rgba(255,255,255,0.15);
-    border-radius:14px; color:#fff; outline:none; margin-bottom:18px; }
-  input:focus { border-color:#667eea; }
-  button { width:100%; padding:15px; font-size:17px; font-weight:600;
-    background:linear-gradient(135deg,#667eea,#764ba2); color:white;
-    border:none; border-radius:14px; cursor:pointer; }
-  .error { color:#fc8181; font-size:14px; margin-top:14px; min-height:20px; }
-</style>
-</head>
-<body>
-  <div class="box">
-    <h1>🔐 PC 원격 제어</h1>
-    <p>비밀번호를 입력하세요</p>
-    <form method="POST" action="/power_login">
-      <input type="password" name="password" inputmode="numeric" maxlength="20" autofocus placeholder="••••">
-      <button type="submit">로그인</button>
-    </form>
-    <div class="error">{{ error }}</div>
-  </div>
-</body>
-</html>
-"""
-
-POWER_CONTROL_PAGE = """
-<!DOCTYPE html>
-<html lang="ko">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>🔌 PC 원격 제어</title>
-<style>
-  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; -webkit-touch-callout: none; user-select: none; }
-  html, body { height:100%; overflow-x:hidden; }
-  body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-    background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);
-    min-height:100vh; padding:12px; color:#eee; }
-  .box { background:rgba(255,255,255,0.06); backdrop-filter:blur(20px);
-    border:1px solid rgba(255,255,255,0.1); border-radius:18px; padding:18px;
-    max-width:900px; margin:0 auto 12px; box-shadow:0 20px 60px rgba(0,0,0,0.5); text-align:center; }
-  .box h1 { font-size:18px; margin-bottom:6px; font-weight:700; }
-  .box p { font-size:12px; color:#a0aec0; margin-bottom:14px; }
-  .status { display:inline-block; padding:6px 14px; border-radius:20px; font-size:12px; margin-bottom:14px; }
-  .status.online { background:rgba(72,187,120,0.15); color:#68d391; }
-  .status.offline { background:rgba(245,101,101,0.15); color:#fc8181; }
-  .status.loading { background:rgba(160,174,192,0.15); color:#a0aec0; }
-  .toggle-btn { width:100%; padding:28px 20px; font-size:20px; font-weight:700;
-    color:#fff; border:none; border-radius:18px; cursor:pointer;
-    display:flex; flex-direction:column; align-items:center; gap:6px; margin-bottom:12px;
-    transition:transform 0.15s; }
-  .toggle-btn:active { transform:scale(0.97); }
-  .toggle-btn:disabled { opacity:0.6; }
-  .toggle-btn.off-state { background:linear-gradient(135deg,#43a047,#2e7d32); box-shadow:0 8px 24px rgba(67,160,71,0.4); }
-  .toggle-btn.on-state { background:linear-gradient(135deg,#e53935,#b71c1c); box-shadow:0 8px 24px rgba(229,57,53,0.4); }
-  .toggle-btn.loading-state { background:rgba(255,255,255,0.1); }
-  .toggle-btn .icon { font-size:38px; }
-  .toggle-btn .text { font-size:16px; }
-  .msg { margin-top:10px; font-size:12px; color:#a0aec0; min-height:16px; }
-  .btn-gray { padding:8px 18px; font-size:12px; background:rgba(255,255,255,0.08);
-    color:#a0aec0; border:1px solid rgba(255,255,255,0.15); border-radius:10px;
-    cursor:pointer; margin-top:10px; }
-
-  #desktopSection { position:relative; }
-  .desktop-box { background:#000; border-radius:14px; overflow:hidden; margin-bottom:10px;
-    position:relative; touch-action:none; display:flex; align-items:center; justify-content:center;
-    min-height:200px; }
-  #screenImg { width:100%; display:block; cursor:crosshair; touch-action:none;
-    -webkit-user-drag:none; pointer-events:auto; }
-  .desktop-overlay { position:absolute; top:6px; left:6px;
-    background:rgba(0,0,0,0.7); color:#68d391; font-size:10px;
-    padding:3px 9px; border-radius:20px; pointer-events:none; z-index:5; }
-  .fs-overlay-btns { position:absolute; top:6px; right:6px; display:flex; gap:6px; z-index:6; }
-  .fs-btn { background:rgba(0,0,0,0.7); color:#fff; font-size:11px;
-    padding:6px 12px; border-radius:20px; border:none; cursor:pointer; }
-
-  .keyboard-area { display:flex; gap:6px; flex-wrap:wrap; margin-bottom:8px; }
-  .keyboard-area input { flex:1; min-width:100px; padding:11px; font-size:14px;
-    background:rgba(0,0,0,0.3); border:2px solid rgba(255,255,255,0.15);
-    border-radius:10px; color:#fff; outline:none; user-select:text; -webkit-user-select:text; }
-  .keyboard-area input:focus { border-color:#667eea; }
-  .keyboard-area button { flex:0 0 auto; padding:11px 16px; font-size:13px;
-    background:linear-gradient(135deg,#43a047,#2e7d32); color:#fff;
-    border:none; border-radius:10px; cursor:pointer; font-weight:600; }
-  .special-keys { display:grid; grid-template-columns:repeat(4, 1fr); gap:6px; }
-  .special-keys button { padding:10px 6px; font-size:11px; font-weight:500;
-    background:rgba(255,255,255,0.08); color:#cbd5e0;
-    border:1px solid rgba(255,255,255,0.15); border-radius:8px; cursor:pointer; }
-  .special-keys button:active { background:rgba(255,255,255,0.2); }
-
-  /* CSS 가짜 전체화면 (모바일 완벽) */
-  #desktopSection.fs-active {
-    position: fixed !important;
-    top: 0 !important; left: 0 !important;
-    right: 0 !important; bottom: 0 !important;
-    width: 100vw !important; height: 100vh !important;
-    max-width: none !important; margin: 0 !important;
-    border-radius: 0 !important; padding: 0 !important;
-    z-index: 99999; background: #000;
-    display: flex !important; flex-direction: column !important;
-    overflow: hidden;
-  }
-  #desktopSection.fs-active .fs-hint { display: none !important; }
-  #desktopSection.fs-active .desktop-box {
-    flex: 1 1 auto; margin: 0 !important; border-radius: 0 !important;
-    min-height: 0;
-  }
-  #desktopSection.fs-active #screenImg {
-    max-width: 100%; max-height: 100%;
-    width: auto !important; height: auto !important; object-fit: contain;
-  }
-  #desktopSection.fs-active .kb-wrap {
-    flex-shrink: 0; padding: 4px 6px 6px 6px; background: #111;
-  }
-  #desktopSection.fs-active .keyboard-area { margin-bottom: 4px; }
-  #desktopSection.fs-active .keyboard-area input { padding:8px; font-size:13px; }
-  #desktopSection.fs-active .keyboard-area button { padding:8px 14px; font-size:12px; }
-  #desktopSection.fs-active .special-keys button { padding:7px 4px; font-size:10px; }
-  body.fs-locked { overflow: hidden; position: fixed; width: 100%; }
-  .fs-hint { font-size:11px; color:#a0aec0; margin-bottom:8px; }
-</style>
-</head>
-<body>
-  <div class="box">
-    <div id="pcStatus" class="status loading">● 확인 중...</div>
-    <h1>🔌 PC 원격 제어</h1>
-    <p>버튼 하나로 켜고 끌 수 있어요</p>
-    <button id="toggleBtn" class="toggle-btn loading-state" onclick="togglePower()" disabled>
-      <span class="icon" id="toggleIcon">⏳</span>
-      <span class="text" id="toggleText">확인 중...</span>
-    </button>
-    <div class="msg" id="msg"></div>
-    <button class="btn-gray" onclick="logout()">로그아웃</button>
-  </div>
-
-  <div class="box" id="desktopSection">
-    <h1 class="fs-hint">🖥️ 원격 데스크톱</h1>
-    <p class="fs-hint">탭=클릭 / 드래그=커서 / 전체화면 버튼</p>
-
-    <div class="desktop-box" id="desktopFrame">
-      <div class="desktop-overlay" id="desktopOverlay">● 대기</div>
-      <div class="fs-overlay-btns">
-        <button class="fs-btn" onclick="toggleFullscreen()" id="fsBtn">⛶ 전체화면</button>
-      </div>
-      <img id="screenImg" alt="" draggable="false">
-    </div>
-
-    <div class="kb-wrap">
-      <div class="keyboard-area">
-        <input type="text" id="textInput" placeholder="텍스트 입력 후 전송"
-               onkeydown="if(event.key==='Enter'){sendText();event.preventDefault();}">
-        <button onclick="sendText()">입력</button>
-      </div>
-      <div class="special-keys">
-        <button onclick="sendKey('enter')">⏎ Enter</button>
-        <button onclick="sendKey('backspace')">⌫ Back</button>
-        <button onclick="sendKey('tab')">⇥ Tab</button>
-        <button onclick="sendKey('esc')">⎋ Esc</button>
-        <button onclick="sendKey('up')">↑ Up</button>
-        <button onclick="sendKey('down')">↓ Down</button>
-        <button onclick="sendKey('left')">← Left</button>
-        <button onclick="sendKey('right')">→ Right</button>
-        <button onclick="sendHotkey(['ctrl','c'])">Ctrl+C</button>
-        <button onclick="sendHotkey(['ctrl','v'])">Ctrl+V</button>
-        <button onclick="sendHotkey(['ctrl','a'])">Ctrl+A</button>
-        <button onclick="sendHotkey(['ctrl','z'])">Ctrl+Z</button>
-        <button onclick="sendHotkey(['alt','f4'])">Alt+F4</button>
-        <button onclick="sendHotkey(['alt','tab'])">Alt+Tab</button>
-        <button onclick="sendHotkey(['win','d'])">Win+D</button>
-        <button onclick="sendHotkey(['ctrl','shift','esc'])">작업관리자</button>
-      </div>
-    </div>
-  </div>
-
-<script>
-let isOnline = false;
-let isBusy = false;
-let screenW = 1920, screenH = 1080;
-
-// 스트림/폴링 상태
-let mode = null;              // 'stream' | 'poll' | null
-let pollTimer = null;
-let streamImg = null;
-let lastFrameAge = 0;
-let frameCount = 0;
-let fpsT = Date.now();
-
-async function updateStatus() {
-  const el = document.getElementById('pcStatus');
-  const btn = document.getElementById('toggleBtn');
-  const icon = document.getElementById('toggleIcon');
-  const text = document.getElementById('toggleText');
-  try {
-    const r = await fetch('/pc_status');
-    const d = await r.json();
-    if (!d.ok) { el.textContent = '● 세션 만료'; el.className = 'status offline'; return; }
-    const wasOnline = isOnline;
-    isOnline = d.online;
-    if (isBusy) return;
-    if (d.online) {
-      el.textContent = '● 켜져있음 (' + (d.hostname || 'PC') + ')';
-      el.className = 'status online';
-      btn.className = 'toggle-btn on-state';
-      btn.disabled = false;
-      icon.textContent = '🔌';
-      text.textContent = '컴퓨터 끄기';
-      screenW = d.screen_width || 1920;
-      screenH = d.screen_height || 1080;
-      if (!wasOnline) startViewer();
-    } else {
-      el.textContent = '● 꺼져있음';
-      el.className = 'status offline';
-      btn.className = 'toggle-btn off-state';
-      btn.disabled = false;
-      icon.textContent = '⏻';
-      text.textContent = '컴퓨터 켜기';
-      if (wasOnline) stopViewer();
-    }
-  } catch (e) { el.textContent = '● 상태 확인 실패'; el.className = 'status offline'; }
-}
-
-// ============ 뷰어 시작 (스트림 시도 → 실패 시 폴링) ============
-function startViewer() {
-  if (mode) return;
-  tryStream();
-}
-
-function tryStream() {
-  mode = 'stream';
-  const img = document.getElementById('screenImg');
-  document.getElementById('desktopOverlay').textContent = '● 스트림 시도...';
-
-  // 3초 안에 로드 안 되면 폴링으로 전환
-  let ok = false;
-  const timeout = setTimeout(() => {
-    if (!ok) {
-      console.log('MJPEG 실패 → 폴링 전환');
-      switchToPolling();
-    }
-  }, 3000);
-
-  img.onload = () => {
-    // MJPEG 첫 프레임 로드됨
-    if (!ok) {
-      ok = true;
-      clearTimeout(timeout);
-      document.getElementById('desktopOverlay').textContent = '● 실시간 스트림';
-      console.log('MJPEG 스트림 시작');
-    }
-  };
-  img.onerror = () => {
-    if (!ok) {
-      ok = true;
-      clearTimeout(timeout);
-      switchToPolling();
-    }
-  };
-  img.src = '/power_stream?t=' + Date.now();
-}
-
-function switchToPolling() {
-  mode = 'poll';
-  const img = document.getElementById('screenImg');
-  img.onload = null;
-  img.onerror = null;
-  img.src = '';
-  document.getElementById('desktopOverlay').textContent = '● 폴링 모드';
-  console.log('폴링 모드 시작');
-
-  if (pollTimer) return;
-  pollTimer = setInterval(async () => {
-    if (!isOnline) return;
-    try {
-      const r = await fetch('/power_frame?t=' + Date.now(), { cache: 'no-store' });
-      if (!r.ok) return;
-      const d = await r.json();
-      if (d.ok && d.image) {
-        img.src = 'data:image/jpeg;base64,' + d.image;
-        frameCount++;
-        const now = Date.now();
-        if (now - fpsT >= 1000) {
-          document.getElementById('desktopOverlay').textContent = '● ' + frameCount + ' FPS';
-          frameCount = 0;
-          fpsT = now;
-        }
-      } else {
-        document.getElementById('desktopOverlay').textContent = '● 프레임 대기중...';
-      }
-    } catch(e) {}
-  }, 150);
-}
-
-function stopViewer() {
-  mode = null;
-  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
-  const img = document.getElementById('screenImg');
-  img.onload = null;
-  img.onerror = null;
-  img.src = '';
-  document.getElementById('desktopOverlay').textContent = '● PC 오프라인';
-}
-
-// 탭 숨김 시 스트림 정지
-document.addEventListener('visibilitychange', () => {
-  if (document.hidden) {
-    if (mode) { 
-      if (mode === 'stream') {
-        document.getElementById('screenImg').src = '';
-        mode = null;
-      }
-    }
-  } else {
-    if (isOnline && !mode) startViewer();
-  }
-});
-
-async function togglePower() {
-  if (isBusy) return;
-  const btn = document.getElementById('toggleBtn');
-  const icon = document.getElementById('toggleIcon');
-  const text = document.getElementById('toggleText');
-  const msg = document.getElementById('msg');
-
-  if (isOnline) {
-    if (!confirm('컴퓨터를 끄시겠습니까?')) return;
-    isBusy = true; btn.disabled = true;
-    icon.textContent = '⏳'; text.textContent = '종료 요청 중...'; msg.textContent = '';
-    try {
-      const r = await fetch('/shutdown', { method: 'POST' });
-      const d = await r.json();
-      msg.textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
-      if (d.ok) {
-        icon.textContent = '✅'; text.textContent = '종료 요청됨';
-        setTimeout(() => { isBusy = false; updateStatus(); }, 3000);
-      } else { isBusy = false; updateStatus(); }
-    } catch (e) { msg.textContent = '❌ 오류'; isBusy = false; updateStatus(); }
-  } else {
-    if (!confirm('컴퓨터를 켜시겠습니까? (약 30초)')) return;
-    isBusy = true; btn.disabled = true;
-    icon.textContent = '⏳'; text.textContent = '켜는 중...';
-    msg.textContent = '매직 패킷 전송 중...';
-    try {
-      const r = await fetch('/wake', { method: 'POST' });
-      const d = await r.json();
-      msg.textContent = d.ok ? '✅ ' + d.message : '❌ ' + d.error;
-      if (d.ok) {
-        icon.textContent = '✅'; text.textContent = '켜는 중...';
-        setTimeout(() => { isBusy = false; updateStatus(); }, 30000);
-      } else { isBusy = false; updateStatus(); }
-    } catch (e) { msg.textContent = '❌ 오류'; isBusy = false; updateStatus(); }
-  }
-}
-
-async function logout() {
-  await fetch('/power_logout', { method: 'POST' });
-  location.reload();
-}
-
-// CSS 전체화면 (모바일 확실)
-function toggleFullscreen() {
-  const el = document.getElementById('desktopSection');
-  const btn = document.getElementById('fsBtn');
-  const on = el.classList.toggle('fs-active');
-  document.body.classList.toggle('fs-locked', on);
-  btn.textContent = on ? '✕ 나가기' : '⛶ 전체화면';
-  try {
-    if (on) {
-      const req = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
-      if (req) req.call(el).catch(()=>{});
-      if (screen.orientation && screen.orientation.lock) {
-        screen.orientation.lock('landscape').catch(()=>{});
-      }
-    } else {
-      if (document.fullscreenElement || document.webkitFullscreenElement) {
-        const ex = document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
-        if (ex) ex.call(document);
-      }
-      if (screen.orientation && screen.orientation.unlock) {
-        try { screen.orientation.unlock(); } catch(e) {}
-      }
-    }
-  } catch(e) {}
-}
-
-// 데스크톱 페이지 열려있음을 서버에 알림
-async function pingDesktop() {
-  try { await fetch('/power_desktop_ping', { method: 'POST' }); } catch(e) {}
-}
-
-function sendInput(cmd) {
-  fetch('/power_input', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(cmd)
-  }).catch(()=>{});
-}
-function sendKey(key) { sendInput({ type: 'key', key: key }); }
-function sendHotkey(keys) { sendInput({ type: 'hotkey', keys: keys }); }
-function sendText() {
-  const inp = document.getElementById('textInput');
-  const txt = inp.value;
-  if (!txt) return;
-  sendInput({ type: 'text', text: txt });
-  inp.value = '';
-}
-
-// 터치/마우스
-const img = document.getElementById('screenImg');
-let pointer = null;
-let lastMoveTime = 0;
-
-function getRelCoords(cx, cy) {
-  const rect = img.getBoundingClientRect();
-  if (rect.width === 0) return null;
-  const rx = (cx - rect.left) / rect.width;
-  const ry = (cy - rect.top) / rect.height;
-  if (rx < 0 || rx > 1 || ry < 0 || ry > 1) return null;
-  return { x: Math.round(rx * screenW), y: Math.round(ry * screenH) };
-}
-function onDown(cx, cy) { if (!isOnline) return; pointer = { x: cx, y: cy, t: Date.now(), moved: false }; }
-function onMove(cx, cy) {
-  if (!pointer) return;
-  if (Math.abs(cx - pointer.x) > 6 || Math.abs(cy - pointer.y) > 6) {
-    pointer.moved = true;
-    const now = Date.now();
-    if (now - lastMoveTime > 30) {
-      lastMoveTime = now;
-      const c = getRelCoords(cx, cy);
-      if (c) sendInput({ type: 'move', x: c.x, y: c.y });
-    }
-  }
-}
-function onUp(cx, cy) {
-  if (!pointer) return;
-  if (!pointer.moved && Date.now() - pointer.t < 500) {
-    const c = getRelCoords(cx, cy);
-    if (c) sendInput({ type: 'click', x: c.x, y: c.y });
-  }
-  pointer = null;
-}
-img.addEventListener('touchstart', e => { e.preventDefault(); onDown(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
-img.addEventListener('touchmove', e => { e.preventDefault(); onMove(e.touches[0].clientX, e.touches[0].clientY); }, { passive: false });
-img.addEventListener('touchend', e => { e.preventDefault(); onUp(e.changedTouches[0].clientX, e.changedTouches[0].clientY); }, { passive: false });
-img.addEventListener('touchcancel', () => { pointer = null; });
-img.addEventListener('mousedown', e => onDown(e.clientX, e.clientY));
-img.addEventListener('mousemove', e => { if (pointer) onMove(e.clientX, e.clientY); });
-img.addEventListener('mouseup', e => onUp(e.clientX, e.clientY));
-img.addEventListener('mouseleave', () => { pointer = null; });
-
-updateStatus();
-setInterval(updateStatus, 5000);
-pingDesktop();
-setInterval(pingDesktop, 5000);
-</script>
-</body>
-</html>
-"""
-
-@app.route('/power')
-def power_page():
-    if not session.get('power_logged_in'):
-        return render_template_string(POWER_LOGIN_PAGE, error="")
-    return render_template_string(POWER_CONTROL_PAGE)
-
-@app.route('/power_login', methods=['POST'])
-def power_login():
-    pw = request.form.get('password', '')
-    if pw == POWER_PASSWORD:
-        session.permanent = True
-        session['power_logged_in'] = True
-        session['power_login_at'] = time.time()
-        return redirect(url_for('power_page'))
-    return render_template_string(POWER_LOGIN_PAGE, error="❌ 비밀번호가 틀렸습니다.")
-
-@app.route('/power_logout', methods=['POST'])
-def power_logout():
-    session.pop('power_logged_in', None)
-    return jsonify({"ok": True})
-
-@app.route('/heartbeat', methods=['POST'])
-def heartbeat():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    pc_status["last_heartbeat"] = time.time()
-    pc_status["hostname"] = data.get("hostname", "?")
-    pc_status["os"] = data.get("os", "?")
-    pc_status["screen_width"] = int(data.get("screen_width", 0))
-    pc_status["screen_height"] = int(data.get("screen_height", 0))
-    return jsonify({"ok": True})
-
-@app.route('/pc_status')
-def pc_status_route():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    elapsed = time.time() - pc_status["last_heartbeat"]
-    return jsonify({
-        "ok": True,
-        "online": elapsed < 30,
-        "hostname": pc_status["hostname"],
-        "os": pc_status["os"],
-        "screen_width": pc_status["screen_width"],
-        "screen_height": pc_status["screen_height"],
-    })
-
-@app.route('/shutdown', methods=['POST'])
-def request_shutdown():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    if time.time() - pc_status["last_heartbeat"] >= 30:
-        return jsonify({"ok": False, "error": "이미 꺼져있습니다."})
-    shutdown_request["requested"] = True
-    shutdown_request["requested_at"] = time.time()
-    return jsonify({"ok": True, "message": "종료 요청 접수됨."})
-
-@app.route('/check_shutdown', methods=['GET'])
-def check_shutdown():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    if shutdown_request["requested"]:
-        shutdown_request["requested"] = False
-        return jsonify({"ok": True, "shutdown": True})
-    return jsonify({"ok": True, "shutdown": False})
-
-@app.route('/wake', methods=['POST'])
-def wake_pc():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    if time.time() - pc_status["last_heartbeat"] < 30:
-        return jsonify({"ok": False, "error": "이미 켜져있습니다."})
-    if not WOL_TARGET or not WOL_MAC:
-        return jsonify({"ok": False, "error": "WOL 미설정"})
-    try:
-        send_magic_packet(WOL_MAC, WOL_TARGET, WOL_PORT)
-        return jsonify({"ok": True, "message": "매직 패킷 전송됨."})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-# ============ 프레임 업로드 (에이전트 → 서버) ============
-@app.route('/agent_frame', methods=['POST'])
-def agent_frame():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-    data = request.get_json(silent=True) or {}
-    img_b64 = data.get("image")
-    if not img_b64:
-        return jsonify({"ok": False, "error": "no image"}), 400
-    try:
-        raw = base64.b64decode(img_b64)
-    except:
-        return jsonify({"ok": False, "error": "bad b64"}), 400
-
-    with frame_lock:
-        frame_store["data"] = raw
-        frame_store["id"] += 1
-        frame_store["updated_at"] = time.time()
-    frame_count["total"] += 1
-    return jsonify({"ok": True})
-
-# ============ MJPEG 스트림 ============
-@app.route('/power_stream')
-def power_stream():
-    if not session.get('power_logged_in'):
-        return "unauthorized", 401
-
-    def gen():
-        last_id = -1
-        idle = 0
-        try:
-            while True:
-                with frame_lock:
-                    fid = frame_store["id"]
-                    fdata = frame_store["data"]
-                if fdata is not None and fid != last_id:
-                    last_id = fid
-                    idle = 0
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n'
-                           b'Content-Length: ' + str(len(fdata)).encode() + b'\r\n\r\n'
-                           + fdata + b'\r\n')
-                else:
-                    idle += 1
-                    time.sleep(0.02)
-                    if idle > 750:  # 15초 동안 프레임 없으면 스트림 종료
-                        break
-        except GeneratorExit:
-            return
-
-    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# ============ 단일 프레임 (폴링용) ============
-@app.route('/power_frame')
-def power_frame():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    with frame_lock:
-        fdata = frame_store["data"]
-        updated = frame_store["updated_at"]
-    if fdata is None:
-        return jsonify({"ok": True, "image": None, "updated_at": 0})
-    # 최신성 체크 (10초 이상 지난 프레임은 무효)
-    if time.time() - updated > 10:
-        return jsonify({"ok": True, "image": None, "updated_at": updated})
-    return jsonify({
-        "ok": True,
-        "image": base64.b64encode(fdata).decode('ascii'),
-        "updated_at": updated,
-    })
-
-# ============ 에이전트 폴링 ============
-@app.route('/agent_poll', methods=['GET'])
-def agent_poll():
-    if request.headers.get('X-Agent-Token') != AGENT_TOKEN:
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
-
-    # 20초 내에 데스크톱 페이지 핑이 있으면 캡처
-    capturing = (time.time() - desktop_session["last_ping"]) < 20
-
-    with input_lock:
-        cmds = list(input_queue)
-        input_queue.clear()
-
-    return jsonify({"ok": True, "capture": capturing, "commands": cmds})
-
-@app.route('/power_input', methods=['POST'])
-def power_input():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False, "error": "로그인 필요"}), 401
-    cmd = request.get_json(silent=True) or {}
-    with input_lock:
-        if cmd.get("type") == "move":
-            input_queue[:] = [c for c in input_queue if c.get("type") != "move"]
-        input_queue.append(cmd)
-        if len(input_queue) > 30:
-            input_queue[:] = input_queue[-30:]
-    return jsonify({"ok": True})
-
-@app.route('/power_desktop_ping', methods=['POST'])
-def power_desktop_ping():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False}), 401
-    desktop_session["last_ping"] = time.time()
-    return jsonify({"ok": True})
-
-# ============ 디버그 ============
-@app.route('/power_debug')
-def power_debug():
-    if not session.get('power_logged_in'):
-        return jsonify({"ok": False}), 401
-    with frame_lock:
-        fid = frame_store["id"]
-        upd = frame_store["updated_at"]
-        sz = len(frame_store["data"]) if frame_store["data"] else 0
-    return jsonify({
-        "ok": True,
-        "frame_id": fid,
-        "frame_size": sz,
-        "last_frame_age": round(time.time() - upd, 2) if upd > 0 else None,
-        "total_uploaded": frame_count["total"],
-        "pc_online": (time.time() - pc_status["last_heartbeat"]) < 30,
-        "desktop_ping_age": round(time.time() - desktop_session["last_ping"], 2) if desktop_session["last_ping"] > 0 else None,
-    })
-
-# ============================================================
-# OAuth2 (기존)
-# ============================================================
 @app.route('/oauth2/login')
 def oauth2_login():
     try:
         guild_id = request.args.get('guild_id')
         user_id = request.args.get('user_id')
         bot_name = request.args.get('bot_name')
+
         state = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-        oauth_states[state] = {"created_at": time.time(), "guild_id": guild_id,
-                                "user_id": user_id, "bot_name": bot_name}
+        oauth_states[state] = {
+            "created_at": time.time(),
+            "guild_id": guild_id,
+            "user_id": user_id,
+            "bot_name": bot_name
+        }
         params = {
             "client_id": DISCORD_CLIENT_ID,
             "redirect_uri": DISCORD_REDIRECT_URI,
             "response_type": "code",
-            "scope": "identify email",
+            "scope": "identify email guilds guilds.join",
             "state": state
         }
-        return redirect(f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}")
+        oauth_url = f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
+        return redirect(oauth_url)
     except Exception as e:
         traceback.print_exc()
-        return f"❌ {str(e)}", 500
+        return f"❌ 오류: {str(e)}", 500
 
 @app.route('/oauth2/callback')
 def oauth2_callback():
@@ -1143,65 +756,80 @@ def oauth2_callback():
         code = request.args.get('code')
         state = request.args.get('state')
         error = request.args.get('error')
-        if error: return f"❌ 인증 오류: {error}", 400
-        if not code: return "❌ 코드 없음", 400
-        if not state or state not in oauth_states: return "❌ 유효하지 않은 state", 400
+
+        if error:
+            return f"❌ Discord 오류: {error}", 400
+        if not code:
+            return "❌ 인증 코드가 없습니다.", 400
+        if not state or state not in oauth_states:
+            return "❌ 유효하지 않은 state입니다.", 400
+
         state_data = oauth_states.pop(state)
         if time.time() - state_data["created_at"] > 600:
             return "❌ state 만료", 400
+
         token_data = exchange_code(code)
-        if 'error' in token_data: return f"❌ 토큰 실패: {token_data}", 400
-        if 'access_token' not in token_data: return f"❌ 토큰 없음: {token_data}", 400
+        if 'error' in token_data or 'access_token' not in token_data:
+            return f"❌ 토큰 교환 실패: {token_data}", 400
+
         access_token = token_data['access_token']
+        refresh_token = token_data.get('refresh_token', '')
         user_data = get_discord_user(access_token)
-        if 'id' not in user_data: return "❌ 사용자 정보 실패", 400
+
+        if 'id' not in user_data:
+            return "❌ 사용자 정보를 가져올 수 없습니다.", 400
+
         session['user_id'] = user_data['id']
         session['user_name'] = user_data.get('global_name') or user_data.get('username')
         session['user_avatar'] = user_data.get('avatar')
         session['user_email'] = user_data.get('email')
         session['access_token'] = access_token
+        session['refresh_token'] = refresh_token
         session['user_data'] = user_data
+
         session['pending_guild_id'] = int(state_data.get('guild_id')) if state_data.get('guild_id') else None
         session['pending_user_id'] = int(state_data.get('user_id')) if state_data.get('user_id') else None
-        session['pending_bot_name'] = state_data.get('bot_name', '인증봇')
+
         return redirect(url_for('captcha_page'))
     except Exception as e:
         traceback.print_exc()
         return f"❌ 서버 오류: {str(e)}", 500
 
+# ============================================================
+# CAPTCHA 페이지
+# ============================================================
 CAPTCHA_PAGE = """
 <!DOCTYPE html>
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>🔐 본인 인증</title>
     <script src="https://www.google.com/recaptcha/api.js" async defer></script>
     <style>
-        * { margin:0; padding:0; box-sizing:border-box; }
-        body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-            background:linear-gradient(135deg,#667eea,#764ba2);
-            min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
-        .container { max-width:420px; width:100%; background:rgba(255,255,255,0.95);
-            border-radius:24px; padding:35px 25px; box-shadow:0 20px 60px rgba(0,0,0,0.3); }
-        .header { text-align:center; margin-bottom:25px; }
-        .header .icon { font-size:48px; display:block; margin-bottom:10px; }
-        .header h1 { font-size:24px; font-weight:700; color:#2d3748; margin-bottom:6px; }
-        .header p { font-size:14px; color:#718096; }
-        .user-card { background:#f7fafc; border-radius:16px; padding:16px 18px;
-            margin-bottom:20px; display:flex; align-items:center; gap:14px; border:1px solid #e2e8f0; }
-        .user-card .avatar { width:48px; height:48px; border-radius:50%; background:#cbd5e0; overflow:hidden; flex-shrink:0; }
-        .user-card .avatar img { width:100%; height:100%; object-fit:cover; }
-        .user-card .info { flex:1; min-width:0; }
-        .user-card .info .name { font-weight:600; color:#2d3748; font-size:15px; }
-        .user-card .info .email { font-size:13px; color:#718096; }
-        .recaptcha-wrapper { display:flex; justify-content:center; margin:20px 0 18px; }
-        .recaptcha-wrapper > div { transform:scale(0.85); }
-        .btn-submit { width:100%; padding:14px; background:linear-gradient(135deg,#667eea,#764ba2);
-            color:white; border:none; border-radius:14px; font-size:17px; font-weight:600; cursor:pointer; }
-        .message { margin-top:16px; padding:12px 16px; border-radius:12px; font-size:14px; text-align:center; display:none; }
-        .message.error { display:block; background:#fed7d7; color:#9b2c2c; }
-        .message.success { display:block; background:#c6f6d5; color:#276749; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+        .container { max-width: 420px; width: 100%; background: rgba(255,255,255,0.95); backdrop-filter: blur(10px); border-radius: 24px; padding: 35px 25px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); animation: slideUp 0.5s ease-out; }
+        @keyframes slideUp { from { opacity: 0; transform: translateY(30px); } to { opacity: 1; transform: translateY(0); } }
+        .header { text-align: center; margin-bottom: 25px; }
+        .header .icon { font-size: 48px; display: block; margin-bottom: 10px; }
+        .header h1 { font-size: 24px; font-weight: 700; color: #2d3748; margin-bottom: 6px; }
+        .header p { font-size: 14px; color: #718096; }
+        .user-card { background: #f7fafc; border-radius: 16px; padding: 16px 18px; margin-bottom: 20px; display: flex; align-items: center; gap: 14px; border: 1px solid #e2e8f0; }
+        .user-card .avatar { width: 48px; height: 48px; border-radius: 50%; background: #cbd5e0; flex-shrink: 0; overflow: hidden; }
+        .user-card .avatar img { width: 100%; height: 100%; object-fit: cover; }
+        .user-card .info { flex: 1; min-width: 0; }
+        .user-card .info .name { font-weight: 600; color: #2d3748; font-size: 15px; }
+        .user-card .info .email { font-size: 13px; color: #718096; }
+        .recaptcha-wrapper { display: flex; justify-content: center; margin: 20px 0 18px; }
+        .recaptcha-wrapper > div { transform: scale(0.85); transform-origin: center; }
+        @media (max-width: 420px) { .recaptcha-wrapper > div { transform: scale(0.75); } }
+        .btn-submit { width: 100%; padding: 14px; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; border: none; border-radius: 14px; font-size: 17px; font-weight: 600; cursor: pointer; box-shadow: 0 4px 14px rgba(102, 126, 234, 0.4); }
+        .btn-submit:active { transform: scale(0.97); }
+        .btn-submit:disabled { opacity: 0.6; cursor: not-allowed; }
+        .message { margin-top: 16px; padding: 12px 16px; border-radius: 12px; font-size: 14px; text-align: center; display: none; }
+        .message.error { display: block; background: #fed7d7; color: #9b2c2c; }
+        .message.success { display: block; background: #c6f6d5; color: #276749; }
     </style>
 </head>
 <body>
@@ -1215,7 +843,9 @@ CAPTCHA_PAGE = """
         <div class="user-card">
             <div class="avatar">
                 {% if user_avatar %}
-                <img src="https://cdn.discordapp.com/avatars/{{ user_id }}/{{ user_avatar }}.png?size=64">
+                <img src="https://cdn.discordapp.com/avatars/{{ user_id }}/{{ user_avatar }}.png?size=64" alt="avatar">
+                {% else %}
+                <div style="width:48px;height:48px;border-radius:50%;background:#cbd5e0;display:flex;align-items:center;justify-content:center;font-size:20px;color:#718096;">{{ user_name|first|upper }}</div>
                 {% endif %}
             </div>
             <div class="info">
@@ -1224,15 +854,24 @@ CAPTCHA_PAGE = """
             </div>
         </div>
         {% endif %}
-        <form method="post">
+        <form method="post" id="captchaForm">
             <div class="recaptcha-wrapper">
                 <div class="g-recaptcha" data-sitekey="{{ site_key }}"></div>
             </div>
             <input type="hidden" name="token" value="{{ token }}">
-            <button type="submit" class="btn-submit">✅ 인증 완료</button>
+            <button type="submit" class="btn-submit" id="submitBtn">✅ 인증 완료</button>
         </form>
-        <div class="message {{ msg_type }}">{{ msg }}</div>
+        <div class="message {{ msg_type }}" id="message">{{ msg }}</div>
     </div>
+    <script>
+        document.getElementById('captchaForm').addEventListener('submit', function() {
+            const btn = document.getElementById('submitBtn');
+            btn.disabled = true;
+            btn.textContent = '⏳ 처리 중...';
+        });
+        const msgEl = document.getElementById('message');
+        if (msgEl.textContent.trim()) msgEl.style.display = 'block';
+    </script>
 </body>
 </html>
 """
@@ -1242,176 +881,218 @@ def captcha_page():
     try:
         if 'user_id' not in session:
             return redirect(url_for('oauth2_login'))
+
         token = request.args.get('token') or request.form.get('token')
         user_id = session.get('user_id')
         user_name = session.get('user_name')
         user_avatar = session.get('user_avatar')
         user_email = session.get('user_email')
         access_token = session.get('access_token')
+        refresh_token = session.get('refresh_token')
         user_data = session.get('user_data', {})
+
         if request.method == 'GET':
             if not token:
                 token = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
                 session['captcha_token'] = token
-            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token,
-                user_id=user_id, user_name=user_name, user_avatar=user_avatar,
-                user_email=user_email, msg="", msg_type="")
+            return render_template_string(
+                CAPTCHA_PAGE,
+                site_key=RECAPTCHA_SITE_KEY or "",
+                token=token,
+                user_id=user_id,
+                user_name=user_name,
+                user_avatar=user_avatar,
+                user_email=user_email,
+                msg="",
+                msg_type=""
+            )
+
         recaptcha_response = request.form.get('g-recaptcha-response')
-        if not recaptcha_response or not verify_recaptcha(recaptcha_response):
-            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token,
-                user_id=user_id, user_name=user_name, user_avatar=user_avatar,
-                user_email=user_email, msg="❌ reCAPTCHA 실패", msg_type="error")
+        if not recaptcha_response:
+            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token, user_id=user_id, user_name=user_name, user_avatar=user_avatar, user_email=user_email, msg="❌ reCAPTCHA를 완료해주세요.", msg_type="error")
+
+        if not verify_recaptcha(recaptcha_response):
+            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token, user_id=user_id, user_name=user_name, user_avatar=user_avatar, user_email=user_email, msg="❌ reCAPTCHA 검증 실패", msg_type="error")
+
         guild_id = session.get('pending_guild_id')
         if not guild_id:
-            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token,
-                user_id=user_id, user_name=user_name, user_avatar=user_avatar,
-                user_email=user_email, msg="❌ 세션 정보 없음", msg_type="error")
+            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token, user_id=user_id, user_name=user_name, user_avatar=user_avatar, user_email=user_email, msg="❌ 세션 정보 없음", msg_type="error")
+
         ip = request.headers.get('X-Forwarded-For', request.remote_addr)
-        if ip and ',' in ip: ip = ip.split(',')[0].strip()
+        if ip and ',' in ip:
+            ip = ip.split(',')[0].strip()
         user_agent = request.headers.get('User-Agent', '알 수 없음')
+
         future = asyncio.run_coroutine_threadsafe(
-            assign_role_from_web_wrapper(token, ip, guild_id, int(user_id), bot,
-                user_data, access_token, user_agent),
-            bot.loop)
+            assign_role_from_web_wrapper(
+                token, ip, guild_id, int(user_id), bot,
+                user_data, access_token, refresh_token, user_agent
+            ),
+            bot.loop
+        )
         try:
             success, message = future.result(timeout=30)
         except Exception as e:
             success, message = False, f"서버 오류: {str(e)}"
+
         if success:
             session.clear()
-            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token="",
-                user_id=user_id, user_name=user_name, user_avatar=user_avatar,
-                user_email=user_email, msg=f"✅ {message}", msg_type="success")
-        return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token,
-            user_id=user_id, user_name=user_name, user_avatar=user_avatar,
-            user_email=user_email, msg=f"❌ {message}", msg_type="error")
+            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token="", user_id=user_id, user_name=user_name, user_avatar=user_avatar, user_email=user_email, msg=f"✅ {message}", msg_type="success")
+        else:
+            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token, user_id=user_id, user_name=user_name, user_avatar=user_avatar, user_email=user_email, msg=f"❌ {message}", msg_type="error")
     except Exception as e:
         traceback.print_exc()
         return f"❌ 서버 오류: {str(e)}", 500
 
-def verify_recaptcha(response_token):
-    if not RECAPTCHA_SECRET_KEY: return False
+def verify_recaptcha(response_token: str) -> bool:
+    if not RECAPTCHA_SECRET_KEY:
+        return False
     try:
-        res = requests.post("https://www.google.com/recaptcha/api/siteverify",
-            data={"secret": RECAPTCHA_SECRET_KEY, "response": response_token}, timeout=10)
+        res = requests.post(
+            "https://www.google.com/recaptcha/api/siteverify",
+            data={"secret": RECAPTCHA_SECRET_KEY, "response": response_token},
+            timeout=10
+        )
         return res.json().get("success", False)
-    except: return False
+    except:
+        return False
 
 # ============================================================
-# ✅ 인증 처리
+# 웹 인증 처리 (DB 저장 + 복구 인원 카운트)
 # ============================================================
-async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance,
-                                        user_data, access_token, user_agent):
+async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, refresh_token, user_agent):
     try:
-        print(f"🔵 인증 시작: guild={guild_id} user={user_id}")
         guild = bot_instance.get_guild(guild_id)
-        if not guild: return False, "서버를 찾을 수 없습니다."
+        if not guild:
+            return False, "서버를 찾을 수 없습니다."
+
         member = guild.get_member(user_id)
-        if not member: return False, "사용자를 찾을 수 없습니다."
+        if not member:
+            return False, "서버에서 사용자를 찾을 수 없습니다."
 
-        fresh_cfg = load_config()
-        gcfg = fresh_cfg.get(str(guild_id), {})
-        print(f"🔵 verify_role={gcfg.get('verify_role')}, log_channel={gcfg.get('log_channel')}")
-
+        gcfg = get_guild_cfg(guild_id)
         verify_role_id = gcfg.get("verify_role")
-        if not verify_role_id: return False, "인증 역할 미설정"
-        role = guild.get_role(int(verify_role_id))
-        if not role: return False, "역할 없음"
+        if not verify_role_id:
+            return False, "인증 역할이 설정되지 않았습니다."
 
-        location, isp, org = "알 수 없음", "알 수 없음", "알 수 없음"
-        is_mobile_data = False
-        country = "알 수 없음"
+        role = guild.get_role(verify_role_id)
+        if not role:
+            return False, "역할이 존재하지 않습니다."
+
+        # IP 정보
+        location = "알 수 없음"
+        isp = "알 수 없음"
+        org = "알 수 없음"
         try:
-            geo = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName,mobile", timeout=5).json()
-            if geo.get('status') == 'success':
-                city = geo.get('city', '')
-                region = geo.get('regionName', '')
-                country = geo.get('country', '알 수 없음')
-                location = f"{city}, {region}, {country}".strip(', ') or country
-                isp = geo.get('isp', '알 수 없음')
-                org = geo.get('org', '알 수 없음')
-                is_mobile_data = geo.get('mobile', False)
-        except Exception as e:
-            print(f"⚠️ ip-api: {e}")
+            geo_res = requests.get(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org,regionName", timeout=5)
+            if geo_res.status_code == 200:
+                geo_data = geo_res.json()
+                if geo_data.get('status') == 'success':
+                    city = geo_data.get('city', '')
+                    region = geo_data.get('regionName', '')
+                    country = geo_data.get('country', '')
+                    location = f"{city}, {region}, {country}".strip(', ')
+                    isp = geo_data.get('isp', '알 수 없음')
+                    org = geo_data.get('org', '알 수 없음')
+        except:
+            pass
 
         is_vpn = detect_vpn(isp, org)
-        if is_vpn: return False, "❌ VPN 사용 불가"
-        if country not in ["South Korea", "KR", "Korea"]: return False, "❌ 해외 불가"
-        if is_mobile_data: return False, "❌ 모바일 데이터 불가 (Wi-Fi)"
+        is_mobile = detect_mobile_data(isp, org, user_agent)
 
-        removable = [r for r in member.roles if r != guild.default_role and r < guild.me.top_role]
-        if removable:
-            await member.remove_roles(*removable, reason="웹 인증")
-        await member.add_roles(role, reason="웹 인증")
-        print(f"✅ 역할 부여: {member}")
+        if is_vpn:
+            return False, "❌ VPN/프록시 사용은 인증이 불가능합니다."
+        if is_mobile:
+            return False, "❌ 모바일 데이터 사용은 인증이 불가능합니다. Wi-Fi로 연결해주세요."
 
+        # 역할 지급 (기존 역할 유지)
+        try:
+            await member.add_roles(role, reason="웹 인증 완료")
+        except discord.Forbidden:
+            return False, "봇 역할이 인증 역할보다 낮습니다. 봇 역할을 위로 올려주세요."
+
+        # ✅ DB에 인증자 저장 (복구용)
+        add_verified_user(guild_id, user_id, access_token or "", refresh_token or "")
+        recovery_count = count_verified_users(guild_id)
+
+        # 서버 목록 파일
         user_guilds = []
         guilds_file = None
         if access_token:
             try:
-                gd = get_user_guilds(access_token)
-                user_guilds = [f"{g['name']} ({g['id']})" for g in gd]
+                guilds_data = get_user_guilds(access_token)
+                user_guilds = [f"{g['name']} ({g['id']})" for g in guilds_data]
                 if user_guilds:
-                    txt = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
-                    guilds_file = discord.File(io.BytesIO(txt.encode('utf-8')),
-                        filename=f"서버목록_{user_id}_{int(time.time())}.txt")
-            except: pass
+                    guilds_text = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
+                    guilds_file = discord.File(
+                        io.BytesIO(guilds_text.encode('utf-8')),
+                        filename=f"서버목록_{user_id}_{int(time.time())}.txt"
+                    )
+            except:
+                pass
 
+        # 계정 생성일
         created_at = user_data.get('created_at')
-        created_str, days_ago = "알 수 없음", "알 수 없음"
+        created_str = "알 수 없음"
+        days_ago = "알 수 없음"
         if created_at:
             try:
-                dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                created_str = dt.strftime("%Y년 %m월 %d일 %A %p %I:%M")
-                days_ago = f"{(datetime.now(timezone.utc) - dt).days}일 전"
-            except: pass
+                created_dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                created_str = created_dt.strftime("%Y년 %m월 %d일 %A %p %I:%M")
+                days_diff = (datetime.now(timezone.utc) - created_dt).days
+                days_ago = f"{days_diff}일 전"
+            except:
+                pass
 
-        email = user_data.get('email') or "이메일 없음"
+        email = user_data.get('email', '이메일 없음')
 
+        # 로그 전송
         log_channel_id = gcfg.get("log_channel")
-        print(f"🔵 로그 채널: {log_channel_id}")
+        if log_channel_id:
+            log_channel = guild.get_channel(log_channel_id)
+            if log_channel:
+                now_kst = datetime.now(KST)
+                embed = discord.Embed(
+                    title="✅ 인증 성공",
+                    description=f"{member.mention} 님이 인증을 완료했습니다.",
+                    color=discord.Color.green(),
+                    timestamp=datetime.now(timezone.utc)
+                )
+                embed.add_field(
+                    name="유저 정보",
+                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})",
+                    inline=False
+                )
+                embed.add_field(name="이메일", value=email, inline=False)
+                embed.add_field(name="계정 생성일", value=f"{created_str} ({days_ago})", inline=False)
+                embed.add_field(name="인증 시각", value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"), inline=False)
+                embed.add_field(
+                    name="아이피 정보",
+                    value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}",
+                    inline=False
+                )
+                embed.add_field(name="기기 정보", value=f"브라우저: {user_agent[:50]}", inline=False)
+                embed.add_field(name="VPN", value="❌" if is_vpn else "✅", inline=True)
+                embed.add_field(name="모바일", value="❌" if is_mobile else "✅", inline=True)
+                embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개", inline=False)
+                # ✅ 예상 복구 인원 (DB 기반)
+                embed.add_field(
+                    name="예상 복구 인원",
+                    value=f"**{recovery_count}명**",
+                    inline=False
+                )
+                embed.set_thumbnail(url=member.display_avatar.url)
 
-        if not log_channel_id:
-            print("⚠️ 로그 채널 미설정 (환경변수 LOG_CHANNEL_ID 확인)")
-        else:
-            lc = guild.get_channel(int(log_channel_id))
-            if not lc:
-                print(f"⚠️ 채널(ID={log_channel_id}) 접근 불가")
-            else:
                 try:
-                    now_kst = datetime.now(KST)
-                    embed = discord.Embed(title="✅ 인증 성공",
-                        description=f"{member.mention} 님이 인증을 완료했습니다.",
-                        color=discord.Color.green(),
-                        timestamp=datetime.now(timezone.utc))
-                    embed.add_field(name="유저",
-                        value=f"{member.mention} | {member} (Global: {user_data.get('global_name', '없음')}, ID: {user_id})",
-                        inline=False)
-                    embed.add_field(name="이메일", value=email, inline=False)
-                    embed.add_field(name="계정 생성일", value=f"{created_str} ({days_ago})", inline=False)
-                    embed.add_field(name="인증 시간", value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"), inline=False)
-                    embed.add_field(name="IP 정보",
-                        value=f"IP: {ip}\n위치: {location}\n통신사: {isp}", inline=False)
-                    embed.add_field(name="기기", value=f"브라우저: {user_agent[:50]}", inline=False)
-                    embed.add_field(name="VPN", value="❌ 예" if is_vpn else "✅ 아니오", inline=True)
-                    embed.add_field(name="모바일", value="❌ 예" if is_mobile_data else "✅ 아니오", inline=True)
-                    embed.add_field(name="참가 서버",
-                        value=f"{len(user_guilds)}개" + (" (파일)" if guilds_file else ""), inline=False)
-                    try: embed.set_thumbnail(url=member.display_avatar.url)
-                    except: pass
-
                     if guilds_file:
-                        await lc.send(embed=embed, file=guilds_file)
+                        await log_channel.send(embed=embed, file=guilds_file)
                     else:
-                        await lc.send(embed=embed)
-                    print(f"✅ 인증로그 전송 → #{lc.name}")
-                except discord.Forbidden as fe:
-                    print(f"❌ 로그 권한 부족: {fe}")
-                except Exception as le:
-                    print(f"❌ 로그 실패: {le}")
-                    traceback.print_exc()
+                        await log_channel.send(embed=embed)
+                except:
+                    pass
 
-        return True, f"역할 {role.name} 지급 완료"
+        return True, f"역할 {role.name}이 지급되었습니다."
+
     except Exception as e:
         traceback.print_exc()
         return False, f"오류: {str(e)}"
@@ -1420,12 +1101,16 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
 # Flask 실행
 # ============================================================
 def run_flask():
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True)
+    app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
 
+# ============================================================
+# 메인
+# ============================================================
 if __name__ == "__main__":
     if not TOKEN:
-        print("❌ DISCORD_BOT_TOKEN 미설정!")
+        print("❌ DISCORD_BOT_TOKEN이 없습니다!")
     else:
-        threading.Thread(target=run_flask, daemon=True).start()
-        print(f"🌐 웹서버 http://{WEB_HOST}:{WEB_PORT}")
+        thread = threading.Thread(target=run_flask, daemon=True)
+        thread.start()
+        print("🌐 웹서버 실행 중 (http://0.0.0.0:5000)")
         bot.run(TOKEN)
