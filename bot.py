@@ -904,7 +904,7 @@ CAPTCHA_PAGE = """
         </form>
         <div class="message {{ msg_type }}" id="message">{{ msg }}</div>
         <div class="notice">
-            🇰🇷 한국 IP만 인증 가능 · 🚫 VPN 사용 불가 · 🚫 모바일 데이터 불가 (Wi-Fi 필수)
+            캡차를 완료하새요
         </div>
     </div>
     <script>
