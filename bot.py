@@ -717,8 +717,8 @@ class ConsoleView(discord.ui.View):
                 inline=False
             )
             embed.add_field(
-                name="⚠️ 인증 조건",
-                value="• 🇰🇷 **한국에서만** 인증 가능\n• 🚫 VPN/프록시 사용 불가\n• 🚫 모바일 데이터 사용 불가 (**Wi-Fi 필수**)",
+                name="인증이 안되면 donthaf_94721 dm",
+                value="사진과 함께",
                 inline=False
             )
             embed.set_footer(text="로그인 후 CAPTCHA를 완료하면 인증이 완료됩니다.")
