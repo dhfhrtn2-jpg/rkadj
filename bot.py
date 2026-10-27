@@ -39,7 +39,7 @@ DISCORD_OAUTH2_URL = "https://discord.com/api/oauth2/authorize"
 DISCORD_TOKEN_URL = "https://discord.com/api/oauth2/token"
 DISCORD_API_BASE = "https://discord.com/api/v10"
 
-# ✅ 보건실 비밀번호 (환경변수로 변경 가능)
+# ✅ 보건실 비밀번호
 BOGUNSIL_PASSWORD = os.getenv("BOGUNSIL_PASSWORD", "6254")
 BOGUNSIL_ADMIN_PASSWORD = os.getenv("BOGUNSIL_ADMIN_PASSWORD", "9999")
 BOGUNSIL_STUDENT_TOKENS = {}
@@ -86,7 +86,6 @@ def init_db():
         verified_at TEXT,
         PRIMARY KEY (guild_id, user_id)
     )''')
-    # ✅ 보건실 대기열 테이블
     c.execute('''CREATE TABLE IF NOT EXISTS bogunsil_queue (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         grade INTEGER NOT NULL,
@@ -293,7 +292,7 @@ def add_user_with_oauth(bot_token, target_guild_id, user_id, user_access_token):
         return False, str(e)
 
 # ============================================================
-# IP 제한 검사 (한국 + VPN 차단 + 모바일 데이터 차단)
+# IP 제한 검사
 # ============================================================
 def check_ip_restrictions(ip: str):
     try:
@@ -730,7 +729,7 @@ async def on_ready():
     print(f"📁 DB 경로: {DB_PATH}")
 
 # ============================================================
-# ✅ 보건실 페이지 템플릿 (학생)
+# ✅ 보건실 페이지 템플릿 (단계별 UI + back 버튼)
 # ============================================================
 BOGUNSIL_PAGE = """
 <!DOCTYPE html>
@@ -749,7 +748,8 @@ body{font-family:'Pretendard',-apple-system,BlinkMacSystemFont,sans-serif;backgr
 @keyframes slideIn{from{opacity:0;transform:translateY(30px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
 header{background:linear-gradient(135deg,#3B82F6 0%,#1D4ED8 100%);padding:22px 24px;display:flex;align-items:center;gap:16px;color:white;position:relative;overflow:hidden}
 header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;height:200px;background:rgba(255,255,255,0.1);border-radius:50%}
-.logo{width:64px;height:64px;object-fit:contain;background:white;border-radius:50%;padding:5px;box-shadow:0 4px 12px rgba(0,0,0,0.15);flex-shrink:0;position:relative;z-index:1}
+.back-btn{background:rgba(255,255,255,0.2);color:white;border:none;border-radius:12px;width:44px;height:44px;font-size:24px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;z-index:10;flex-shrink:0;font-family:inherit}
+.back-btn:active{transform:scale(0.9);background:rgba(255,255,255,0.3)}
 .header-text{position:relative;z-index:1}
 .header-text h1{font-size:19px;font-weight:800;margin-bottom:4px;letter-spacing:-.02em}
 .header-text p{font-size:13px;opacity:.92;font-weight:500}
@@ -765,15 +765,12 @@ header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;heigh
 .btn-primary{width:100%;padding:17px;background:linear-gradient(135deg,#3B82F6 0%,#1D4ED8 100%);color:white;border:none;border-radius:16px;font-size:17px;font-weight:800;cursor:pointer;transition:all .2s;box-shadow:0 6px 20px rgba(59,130,246,.35);margin-top:16px;font-family:inherit;letter-spacing:-.01em}
 .btn-primary:active{transform:scale(.97)}
 .btn-primary:disabled{opacity:.6;cursor:not-allowed;transform:none}
-.btn-ghost{width:100%;padding:15px;background:white;color:var(--muted);border:2px solid var(--border);border-radius:16px;font-size:15px;font-weight:700;cursor:pointer;margin-top:10px;font-family:inherit}
-.btn-ghost:active{transform:scale(.97);background:#F9FAFB}
-.question{margin-bottom:26px}
 .question-title{font-size:17px;font-weight:800;margin-bottom:14px;text-align:center;color:#1F2937;letter-spacing:-.02em}
 .options{display:grid;grid-template-columns:repeat(6,1fr);gap:9px}
+.options.cols-7{grid-template-columns:repeat(4,1fr)} /* 반 선택용 7개 대응 */
 .option-btn{aspect-ratio:1;display:flex;align-items:center;justify-content:center;background:#F9FAFB;border:2px solid var(--border);border-radius:14px;font-size:19px;font-weight:800;color:var(--muted);cursor:pointer;transition:all .18s;font-family:inherit}
 .option-btn:active{transform:scale(.93)}
-.option-btn.selected{background:linear-gradient(135deg,#3B82F6 0%,#1D4ED8 100%);border-color:var(--primary);color:white;box-shadow:0 6px 16px rgba(59,130,246,.4);transform:translateY(-2px)}
-.number-wrap{display:flex;justify-content:center}
+.number-wrap{display:flex;justify-content:center;margin-bottom:20px}
 .number-box{position:relative;width:180px}
 .number-input{width:100%;padding:18px 56px 18px 18px;font-size:32px;font-weight:800;text-align:center;border:2px solid var(--border);border-radius:18px;background:#F9FAFB;color:var(--primary);font-family:inherit}
 .number-input:focus{outline:none;border-color:var(--primary);background:white;box-shadow:0 0 0 5px rgba(59,130,246,.15)}
@@ -790,7 +787,7 @@ header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;heigh
 <body>
 <div class="page">
 <header>
-<img src="/logo.png" class="logo" alt="로고" onerror="this.style.background='white';this.src='data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏫</text></svg>'">
+<button id="back-btn" class="back-btn" onclick="goBack()" style="display:none;">←</button>
 <div class="header-text">
 <h1>보건실 방문 접수</h1>
 <p>청일초등학교</p>
@@ -798,6 +795,7 @@ header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;heigh
 </header>
 <div class="content">
 
+<!-- Step 0: Password -->
 <div id="step-password" class="step active">
 <div class="step-title">🔒 비밀번호 입력</div>
 <div class="step-subtitle">선생님께 안내받은 4자리 비밀번호를 입력하세요</div>
@@ -806,30 +804,35 @@ header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;heigh
 <div class="error-msg" id="pw-error"></div>
 </div>
 
-<div id="step-form" class="step">
-<div class="question">
+<!-- Step 1: Grade -->
+<div id="step-grade" class="step">
 <div class="question-title">몇 학년이에요?</div>
-<div class="options" id="grade-options">
-<button class="option-btn" onclick="selectOption(this,'grade',1)">1</button>
-<button class="option-btn" onclick="selectOption(this,'grade',2)">2</button>
-<button class="option-btn" onclick="selectOption(this,'grade',3)">3</button>
-<button class="option-btn" onclick="selectOption(this,'grade',4)">4</button>
-<button class="option-btn" onclick="selectOption(this,'grade',5)">5</button>
-<button class="option-btn" onclick="selectOption(this,'grade',6)">6</button>
+<div class="options">
+<button class="option-btn" onclick="selectGrade(1)">1</button>
+<button class="option-btn" onclick="selectGrade(2)">2</button>
+<button class="option-btn" onclick="selectGrade(3)">3</button>
+<button class="option-btn" onclick="selectGrade(4)">4</button>
+<button class="option-btn" onclick="selectGrade(5)">5</button>
+<button class="option-btn" onclick="selectGrade(6)">6</button>
 </div>
 </div>
-<div class="question">
+
+<!-- Step 2: Class -->
+<div id="step-class" class="step">
 <div class="question-title">몇 반이에요?</div>
-<div class="options" id="class-options">
-<button class="option-btn" onclick="selectOption(this,'class_num',1)">1</button>
-<button class="option-btn" onclick="selectOption(this,'class_num',2)">2</button>
-<button class="option-btn" onclick="selectOption(this,'class_num',3)">3</button>
-<button class="option-btn" onclick="selectOption(this,'class_num',4)">4</button>
-<button class="option-btn" onclick="selectOption(this,'class_num',5)">5</button>
-<button class="option-btn" onclick="selectOption(this,'class_num',6)">6</button>
+<div class="options cols-7">
+<button class="option-btn" onclick="selectClass(1)">1</button>
+<button class="option-btn" onclick="selectClass(2)">2</button>
+<button class="option-btn" onclick="selectClass(3)">3</button>
+<button class="option-btn" onclick="selectClass(4)">4</button>
+<button class="option-btn" onclick="selectClass(5)">5</button>
+<button class="option-btn" onclick="selectClass(6)">6</button>
+<button class="option-btn" onclick="selectClass(7)">7</button>
 </div>
 </div>
-<div class="question">
+
+<!-- Step 3: Number -->
+<div id="step-number" class="step">
 <div class="question-title">몇 번이에요?</div>
 <div class="number-wrap">
 <div class="number-box">
@@ -837,11 +840,11 @@ header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;heigh
 <span class="unit">번</span>
 </div>
 </div>
-</div>
 <button class="btn-primary" onclick="submitForm()" id="form-btn">다음</button>
 <div class="error-msg" id="form-error"></div>
 </div>
 
+<!-- Step 4: Success -->
 <div id="step-success" class="step">
 <div class="success-icon">✓</div>
 <div class="success-title">접수됐어요!</div>
@@ -852,58 +855,128 @@ header::after{content:'';position:absolute;top:-50%;right:-20%;width:200px;heigh
 </div>
 </div>
 <script>
-let selectedGrade=null,selectedClass=null,authToken=null;
+let currentStep = 0;
+let selectedGrade = null;
+let selectedClass = null;
+let authToken = null;
+
+function init() {
+  authToken = localStorage.getItem('bogunsil_token');
+  if (authToken) {
+    currentStep = 1; // 비번 입력 건너뛰고 학년 선택으로
+  } else {
+    currentStep = 0;
+  }
+  updateUI();
+}
+
+function updateUI() {
+  document.querySelectorAll('.step').forEach(el => el.classList.remove('active'));
+  if (currentStep === 0) document.getElementById('step-password').classList.add('active');
+  if (currentStep === 1) document.getElementById('step-grade').classList.add('active');
+  if (currentStep === 2) document.getElementById('step-class').classList.add('active');
+  if (currentStep === 3) document.getElementById('step-number').classList.add('active');
+  if (currentStep === 4) document.getElementById('step-success').classList.add('active');
+
+  const backBtn = document.getElementById('back-btn');
+  if (currentStep === 0 || currentStep === 1) {
+    backBtn.style.display = 'none';
+  } else {
+    backBtn.style.display = 'flex';
+  }
+}
+
+function goBack() {
+  if (currentStep === 2) currentStep = 1;
+  else if (currentStep === 3) currentStep = 2;
+  else if (currentStep === 4) currentStep = 1;
+  updateUI();
+}
+
 function checkPassword(){
-  const pw=document.getElementById('pw').value;
-  const errEl=document.getElementById('pw-error');
-  const btn=document.getElementById('pw-btn');
-  if(pw.length!==4){errEl.textContent='4자리를 입력해주세요';return;}
-  btn.disabled=true;btn.textContent='확인 중...';errEl.textContent='';
-  fetch('/bogunsil/api/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
-  .then(r=>r.json()).then(data=>{
-    if(data.success){authToken=data.token;document.getElementById('step-password').classList.remove('active');document.getElementById('step-form').classList.add('active');}
-    else{errEl.textContent=data.message||'비밀번호가 틀렸어요';document.getElementById('pw').value='';}
-  }).catch(()=>{errEl.textContent='서버 오류가 발생했어요';}).finally(()=>{btn.disabled=false;btn.textContent='확인';});
+  const pw = document.getElementById('pw').value;
+  const errEl = document.getElementById('pw-error');
+  const btn = document.getElementById('pw-btn');
+  if(pw.length !== 4){ errEl.textContent = '4자리를 입력해주세요'; return; }
+  btn.disabled = true; btn.textContent = '확인 중...'; errEl.textContent = '';
+  
+  fetch('/bogunsil/api/auth', {
+    method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({password:pw})
+  }).then(r=>r.json()).then(data=>{
+    if(data.success) {
+      authToken = data.token;
+      localStorage.setItem('bogunsil_token', authToken); // 비번 저장 (로그인 유지)
+      currentStep = 1;
+      updateUI();
+    } else {
+      errEl.textContent = data.message || '비밀번호가 틀렸어요';
+      document.getElementById('pw').value = '';
+    }
+  }).catch(()=>{ errEl.textContent = '서버 오류가 발생했어요'; })
+  .finally(()=>{ btn.disabled = false; btn.textContent = '확인'; });
 }
-function selectOption(btn,type,value){
-  const parent=btn.parentElement;
-  parent.querySelectorAll('.option-btn').forEach(b=>b.classList.remove('selected'));
-  btn.classList.add('selected');
-  if(type==='grade')selectedGrade=value;
-  if(type==='class_num')selectedClass=value;
+
+function selectGrade(g) {
+  selectedGrade = g;
+  currentStep = 2;
+  updateUI();
 }
+
+function selectClass(c) {
+  selectedClass = c;
+  currentStep = 3;
+  updateUI();
+}
+
 function submitForm(){
-  const errEl=document.getElementById('form-error');
-  const btn=document.getElementById('form-btn');
-  const numVal=document.getElementById('student-num').value;
-  if(!selectedGrade){errEl.textContent='학년을 선택해주세요';return;}
-  if(!selectedClass){errEl.textContent='반을 선택해주세요';return;}
-  if(!numVal||parseInt(numVal)<1||parseInt(numVal)>99){errEl.textContent='번호를 1~99 사이로 입력해주세요';return;}
-  btn.disabled=true;btn.textContent='접수 중...';errEl.textContent='';
-  fetch('/bogunsil/api/submit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:authToken,grade:selectedGrade,class_num:selectedClass,student_num:parseInt(numVal)})})
-  .then(r=>r.json()).then(data=>{
-    if(data.success){document.getElementById('step-form').classList.remove('active');document.getElementById('step-success').classList.add('active');}
-    else{errEl.textContent=data.message||'접수에 실패했어요';if(data.expired){location.reload();}}
-  }).catch(()=>{errEl.textContent='서버 오류가 발생했어요';}).finally(()=>{btn.disabled=false;btn.textContent='다음';});
+  const errEl = document.getElementById('form-error');
+  const btn = document.getElementById('form-btn');
+  const numVal = document.getElementById('student-num').value;
+  
+  if(!numVal || parseInt(numVal) < 1 || parseInt(numVal) > 99) {
+    errEl.textContent = '번호를 1~99 사이로 입력해주세요';
+    return;
+  }
+  
+  btn.disabled = true; btn.textContent = '접수 중...'; errEl.textContent = '';
+  
+  fetch('/bogunsil/api/submit', {
+    method:'POST', headers:{'Content-Type':'application/json'}, 
+    body:JSON.stringify({token:authToken, grade:selectedGrade, class_num:selectedClass, student_num:parseInt(numVal)})
+  }).then(r=>r.json()).then(data=>{
+    if(data.success) {
+      currentStep = 4;
+      updateUI();
+    } else {
+      errEl.textContent = data.message || '접수에 실패했어요';
+      if(data.expired) {
+        localStorage.removeItem('bogunsil_token');
+        authToken = null;
+        currentStep = 0;
+        updateUI();
+      }
+    }
+  }).catch(()=>{ errEl.textContent = '서버 오류가 발생했어요'; })
+  .finally(()=>{ btn.disabled = false; btn.textContent = '다음'; });
 }
+
 function goHome(){
-  selectedGrade=null;selectedClass=null;authToken=null;
-  document.getElementById('pw').value='';
-  document.getElementById('student-num').value='';
-  document.querySelectorAll('.option-btn').forEach(b=>b.classList.remove('selected'));
-  document.getElementById('step-success').classList.remove('active');
-  document.getElementById('step-password').classList.add('active');
-  document.getElementById('pw-error').textContent='';
-  document.getElementById('form-error').textContent='';
+  selectedGrade = null;
+  selectedClass = null;
+  document.getElementById('student-num').value = '';
+  currentStep = 1; // 처음부터 (비번은 유지)
+  updateUI();
 }
-document.getElementById('pw').addEventListener('keypress',e=>{if(e.key==='Enter')checkPassword();});
+
+document.getElementById('pw').addEventListener('keypress', e => { if(e.key === 'Enter') checkPassword(); });
+window.onload = init;
 </script>
 </body>
 </html>
 """
 
 # ============================================================
-# ✅ 보건실 관리자 페이지 템플릿
+# ✅ 보건실 관리자 페이지 템플릿 (삭제 경고 없음, 로그인 유지)
 # ============================================================
 BOGUNSIL_ADMIN_PAGE = """
 <!DOCTYPE html>
@@ -922,7 +995,8 @@ body{font-family:'Pretendard',-apple-system,BlinkMacSystemFont,sans-serif;backgr
 @keyframes slideIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
 header{background:linear-gradient(135deg,#1F2937 0%,#111827 100%);padding:24px 28px;display:flex;align-items:center;gap:18px;color:white;position:relative;overflow:hidden}
 header::after{content:'';position:absolute;top:-60%;right:-10%;width:240px;height:240px;background:rgba(59,130,246,.15);border-radius:50%}
-.logo{width:70px;height:70px;object-fit:contain;background:white;border-radius:50%;padding:5px;box-shadow:0 6px 16px rgba(0,0,0,.3);flex-shrink:0;position:relative;z-index:1}
+.back-btn{background:rgba(255,255,255,0.2);color:white;border:none;border-radius:12px;width:44px;height:44px;font-size:24px;font-weight:bold;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s;z-index:10;flex-shrink:0;font-family:inherit}
+.back-btn:active{transform:scale(0.9);background:rgba(255,255,255,0.3)}
 .header-text{position:relative;z-index:1}
 .header-text h1{font-size:22px;font-weight:800;margin-bottom:4px;letter-spacing:-.02em}
 .header-text p{font-size:13px;opacity:.85;font-weight:500}
@@ -963,7 +1037,7 @@ header::after{content:'';position:absolute;top:-60%;right:-10%;width:240px;heigh
 <body>
 <div class="page">
 <header>
-<img src="/logo.png" class="logo" alt="로고" onerror="this.style.background='white';this.src='data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏫</text></svg>'">
+<button class="back-btn" onclick="logout()" title="로그아웃">←</button>
 <div class="header-text">
 <h1>보건실 관리자</h1>
 <p>청일초등학교 · 접수 대기열</p>
@@ -993,32 +1067,68 @@ header::after{content:'';position:absolute;top:-60%;right:-10%;width:240px;heigh
 </div>
 </div>
 <script>
-let adminToken=null;
+let adminToken = localStorage.getItem('bogunsil_admin_token');
+
+function checkAdminAuth(){
+  if(adminToken){
+    document.getElementById('step-auth').classList.remove('active');
+    document.getElementById('step-queue').classList.add('active');
+    loadQueue();
+    setInterval(loadQueue, 3000);
+  }
+}
+window.onload = checkAdminAuth;
+
 function adminAuth(){
-  const pw=document.getElementById('admin-pw').value;
-  const errEl=document.getElementById('admin-error');
-  const btn=document.getElementById('admin-btn');
-  if(pw.length!==4){errEl.textContent='4자리를 입력해주세요';return;}
-  btn.disabled=true;btn.textContent='확인 중...';errEl.textContent='';
+  const pw = document.getElementById('admin-pw').value;
+  const errEl = document.getElementById('admin-error');
+  const btn = document.getElementById('admin-btn');
+  if(pw.length !== 4){ errEl.textContent = '4자리를 입력해주세요'; return; }
+  btn.disabled = true; btn.textContent = '확인 중...'; errEl.textContent = '';
   fetch('/bogunsil/api/admin-auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})})
   .then(r=>r.json()).then(data=>{
-    if(data.success){adminToken=data.token;document.getElementById('step-auth').classList.remove('active');document.getElementById('step-queue').classList.add('active');loadQueue();setInterval(loadQueue,3000);}
-    else{errEl.textContent=data.message||'비밀번호가 틀렸어요';document.getElementById('admin-pw').value='';}
-  }).catch(()=>{errEl.textContent='서버 오류가 발생했어요';}).finally(()=>{btn.disabled=false;btn.textContent='접속';});
+    if(data.success){
+      adminToken = data.token;
+      localStorage.setItem('bogunsil_admin_token', adminToken); // 저장
+      document.getElementById('step-auth').classList.remove('active');
+      document.getElementById('step-queue').classList.add('active');
+      loadQueue();
+      setInterval(loadQueue, 3000);
+    } else {
+      errEl.textContent = data.message || '비밀번호가 틀렸어요';
+      document.getElementById('admin-pw').value = '';
+    }
+  }).catch(()=>{ errEl.textContent = '서버 오류가 발생했어요'; })
+  .finally(()=>{ btn.disabled = false; btn.textContent = '접속'; });
 }
+
+function logout(){
+  localStorage.removeItem('bogunsil_admin_token');
+  adminToken = null;
+  document.getElementById('step-queue').classList.remove('active');
+  document.getElementById('step-auth').classList.add('active');
+  document.getElementById('admin-pw').value = '';
+  document.getElementById('admin-error').textContent = '';
+}
+
 function loadQueue(){
-  if(!adminToken)return;
+  if(!adminToken) return;
   fetch('/bogunsil/api/queue?token='+encodeURIComponent(adminToken))
-  .then(r=>r.json()).then(data=>{
-    if(!data.success){return;}
-    const list=document.getElementById('queue-list');
-    const count=document.getElementById('queue-count');
-    count.textContent=data.queue.length;
-    if(data.queue.length===0){
+  .then(r=>{
+    if(r.status === 403){
+      logout(); return null;
+    }
+    return r.json();
+  }).then(data=>{
+    if(!data || !data.success) return;
+    const list = document.getElementById('queue-list');
+    const count = document.getElementById('queue-count');
+    count.textContent = data.queue.length;
+    if(data.queue.length === 0){
       list.innerHTML='<div class="queue-empty"><div class="icon">📋</div><p>아직 접수된 학생이 없어요</p></div>';
       return;
     }
-    list.innerHTML=data.queue.map((item,idx)=>`
+    list.innerHTML = data.queue.map((item, idx) => `
       <div class="queue-item" data-id="${item.id}">
         <div class="queue-order">${idx+1}</div>
         <div class="queue-info">
@@ -1030,19 +1140,22 @@ function loadQueue(){
     `).join('');
   }).catch(()=>{});
 }
+
+// 경고창 없이 즉시 삭제
 function deleteItem(id){
-  if(!adminToken)return;
-  if(!confirm('이 접수를 삭제할까요?'))return;
+  if(!adminToken) return;
   fetch('/bogunsil/api/delete/'+id+'?token='+encodeURIComponent(adminToken),{method:'DELETE'})
-  .then(r=>r.json()).then(data=>{if(data.success)loadQueue();});
+  .then(r=>r.json()).then(data=>{ if(data.success) loadQueue(); });
 }
+
 function resetAll(){
-  if(!adminToken)return;
-  if(!confirm('모든 접수를 삭제할까요? 되돌릴 수 없어요.'))return;
+  if(!adminToken) return;
+  if(!confirm('모든 접수를 삭제할까요? 되돌릴 수 없어요.')) return;
   fetch('/bogunsil/api/reset?token='+encodeURIComponent(adminToken),{method:'POST'})
-  .then(r=>r.json()).then(data=>{if(data.success)loadQueue();});
+  .then(r=>r.json()).then(data=>{ if(data.success) loadQueue(); });
 }
-document.getElementById('admin-pw').addEventListener('keypress',e=>{if(e.key==='Enter')adminAuth();});
+
+document.getElementById('admin-pw').addEventListener('keypress', e => { if(e.key === 'Enter') adminAuth(); });
 </script>
 </body>
 </html>
@@ -1054,15 +1167,6 @@ document.getElementById('admin-pw').addEventListener('keypress',e=>{if(e.key==='
 @app.route('/')
 def home():
     return "✅ Bot is alive and running!", 200
-
-@app.route('/logo.png')
-def serve_logo():
-    try:
-        if os.path.exists('logo.png'):
-            return send_file('logo.png', mimetype='image/png')
-    except:
-        pass
-    return "", 404
 
 # ---------- 보건실 라우트 ----------
 @app.route('/bogunsil')
@@ -1081,7 +1185,7 @@ def bogunsil_api_auth():
         pw = str(data.get('password', '')).strip()
         if pw == BOGUNSIL_PASSWORD:
             token = secrets.token_urlsafe(32)
-            BOGUNSIL_STUDENT_TOKENS[token] = time.time() + 3600
+            BOGUNSIL_STUDENT_TOKENS[token] = time.time() + 86400 # 24시간 유지
             return jsonify({'success': True, 'token': token})
         return jsonify({'success': False, 'message': '비밀번호가 틀렸어요'})
     except Exception as e:
@@ -1102,13 +1206,13 @@ def bogunsil_api_submit():
 
         if not isinstance(grade, int) or grade < 1 or grade > 6:
             return jsonify({'success': False, 'message': '학년이 올바르지 않아요'})
-        if not isinstance(class_num, int) or class_num < 1 or class_num > 6:
+        if not isinstance(class_num, int) or class_num < 1 or class_num > 7:
             return jsonify({'success': False, 'message': '반이 올바르지 않아요'})
         if not isinstance(student_num, int) or student_num < 1 or student_num > 99:
             return jsonify({'success': False, 'message': '번호가 올바르지 않아요'})
 
         bogunsil_add(grade, class_num, student_num)
-        del BOGUNSIL_STUDENT_TOKENS[token]  # 토큰 1회용
+        # 토큰은 유지 (다시 접수할 수 있게)
         return jsonify({'success': True})
     except Exception as e:
         traceback.print_exc()
