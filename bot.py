@@ -1474,4 +1474,4 @@ if __name__ == "__main__":
         print("🌐 웹서버 실행 중 (http://0.0.0.0:5000)")
         print(f"🏥 보건실: {BASE_URL}/bogunsil (비밀번호: {BOGUNSIL_PASSWORD})")
         print(f"🔧 관리자: {BASE_URL}/bogunsil/admin (비밀번호: {BOGUNSIL_ADMIN_PASSWORD})")
-        bot.run(TO
+        bot.run(TOKEN)
